@@ -526,7 +526,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_gpus', type=int, default=1, help='Number of GPUs for model parallelism in Fisher estimation (default: 1)')
     parser.add_argument('--calibration_steps', type=int, default=100, help='Number of calibration steps per layer for post-compression refinement (default: 100)')
     parser.add_argument('--min_rank', type=int, default=16, help='Minimum rank to keep per projection (default: 16)')
-    parser.add_argument('--fisher_lambda', type=float, default=2.0, help='Weight for Fisher in log-space formula: Score = log(σ) + λ×log(F). Higher values give Fisher more influence (default: 2.0)')
+    parser.add_argument('--fisher_lambda', type=float, default=1.0, help='Weight for Fisher in log-space formula: Score = α×log(σ) + λ×log(F). For second-order σ²F alignment use λ=1 (default: 1.0)')
+    parser.add_argument('--sigma_alpha', type=float, default=2.0, help='Weight for singular-value term in log-space formula. α=2 aligns with σ²F (default: 2.0)')
+    parser.add_argument('--score_layer_norm', type=str, default='mad', choices=['none', 'mad', 'zscore', 'l2'],
+                        help='Layer-wise score normalization before global rank allocation (default: mad)')
+    parser.add_argument('--log_sigma_clip_q', type=float, default=0.01,
+                        help='Quantile clipping for log(σ): q -> [q, 1-q], set 0 to disable (default: 0.01)')
+    parser.add_argument('--no_score_center', action='store_true',
+                        help='Disable per-projection median centering for log(σ)/log(F)')
     # NOTE: max_rank_ratio is now adaptive (entropy-based), no longer needs manual tuning
     parser.add_argument('--use_als', action='store_true', default=True, help='Use ALS calibration in Phase 4 (default: True)')
     parser.add_argument('--no_als', action='store_true', help='Disable ALS calibration, use M-optimization instead')
@@ -661,6 +668,10 @@ if __name__ == '__main__':
             calibration_steps=args.calibration_steps,
             min_rank=args.min_rank,
             fisher_lambda=args.fisher_lambda,
+            sigma_alpha=args.sigma_alpha,
+            score_layer_norm=args.score_layer_norm,
+            log_sigma_clip_quantile=args.log_sigma_clip_q,
+            center_per_projection=not args.no_score_center,
             use_als=args.use_als,
             als_iters=args.als_iters,
             token_sample_ratio=args.token_sample_ratio,
