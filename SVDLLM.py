@@ -528,10 +528,12 @@ if __name__ == '__main__':
     parser.add_argument('--min_rank', type=int, default=16, help='Minimum rank to keep per projection (default: 16)')
     parser.add_argument('--fisher_lambda', type=float, default=1.0, help='Weight for Fisher in log-space formula: Score = α×log(σ) + λ×log(F). For second-order σ²F alignment use λ=1 (default: 1.0)')
     parser.add_argument('--sigma_alpha', type=float, default=2.0, help='Weight for singular-value term in log-space formula. α=2 aligns with σ²F (default: 2.0)')
-    parser.add_argument('--score_layer_norm', type=str, default='mad', choices=['none', 'mad', 'zscore', 'l2'],
-                        help='Layer-wise score normalization before global rank allocation (default: mad)')
+    parser.add_argument('--score_layer_norm', type=str, default='none', choices=['none', 'mad', 'zscore', 'l2'],
+                        help='Layer-wise score normalization before global rank allocation (default: none)')
     parser.add_argument('--log_sigma_clip_q', type=float, default=0.01,
                         help='Quantile clipping for log(σ): q -> [q, 1-q], set 0 to disable (default: 0.01)')
+    parser.add_argument('--layer_factor_strength', type=float, default=0.0,
+                        help='Cross-layer position bias strength in Phase 3 (0 disables; 0.5 gives [0.5,1.5])')
     parser.add_argument('--score_center', action='store_true',
                         help='Enable per-projection median centering for log(σ)/log(F) (default: disabled)')
     parser.add_argument('--no_score_center', action='store_true',
@@ -674,6 +676,7 @@ if __name__ == '__main__':
             score_layer_norm=args.score_layer_norm,
             log_sigma_clip_quantile=args.log_sigma_clip_q,
             center_per_projection=(args.score_center and not args.no_score_center),
+            layer_factor_strength=args.layer_factor_strength,
             use_als=args.use_als,
             als_iters=args.als_iters,
             token_sample_ratio=args.token_sample_ratio,

@@ -788,7 +788,9 @@ class FisherAwareSVD:
         else:
             self.model = self.model.to(self.device)
 
-        self.model.train()
+        # Use eval mode for deterministic statistics (no dropout),
+        # while still enabling gradients for Fisher estimation.
+        self.model.eval()
 
         # Enable gradient checkpointing to save memory
         if hasattr(self.model, 'gradient_checkpointing_enable'):
@@ -799,7 +801,7 @@ class FisherAwareSVD:
         for layer_idx in self.svd_layer_refs:
             layer_fisher = {}
             for name, svd_layer in self.svd_layer_refs[layer_idx].items():
-                layer_fisher[name] = torch.zeros_like(svd_layer.sigma.data, device='cpu')
+                layer_fisher[name] = torch.zeros_like(svd_layer.sigma.data, device='cpu', dtype=torch.float64)
             self.fisher_info[layer_idx] = layer_fisher
 
         # Accumulate Fisher information with PER-SAMPLE gradients
@@ -823,6 +825,12 @@ class FisherAwareSVD:
                     # Forward pass with cross-entropy loss for single sample
                     outputs = self.model(**single_sample, labels=single_sample['input_ids'])
                     loss = outputs.loss
+                    # Scale CE mean loss back to token-sum scale to reduce tiny-gradient underflow.
+                    if 'attention_mask' in single_sample:
+                        token_count = max(1, int(single_sample['attention_mask'].sum().item()) - 1)
+                    else:
+                        token_count = max(1, single_sample['input_ids'].numel() - 1)
+                    loss = loss * token_count
                     total_loss += loss.item()
 
                     # Backward pass
@@ -832,7 +840,8 @@ class FisherAwareSVD:
                     for layer_idx in self.svd_layer_refs:
                         for name, svd_layer in self.svd_layer_refs[layer_idx].items():
                             if svd_layer.sigma.grad is not None:
-                                self.fisher_info[layer_idx][name] += svd_layer.sigma.grad.pow(2).cpu()
+                                grad_sq = svd_layer.sigma.grad.detach().float().pow(2).cpu().double()
+                                self.fisher_info[layer_idx][name] += grad_sq
 
                     num_samples += 1
 
@@ -852,6 +861,7 @@ class FisherAwareSVD:
             for layer_idx in self.fisher_info:
                 for name in self.fisher_info[layer_idx]:
                     self.fisher_info[layer_idx][name] /= num_samples
+                    self.fisher_info[layer_idx][name] = self.fisher_info[layer_idx][name].float()
 
             avg_loss = total_loss / num_samples
             print(f"  Average calibration loss: {avg_loss:.4f}")
@@ -1069,7 +1079,8 @@ class FisherAwareSVD:
                                   log_sigma_clip_quantile: float = 0.01,
                                   center_per_projection: bool = False,
                                   sigma_eps: float = 1e-10,
-                                  fisher_eps: float = 1e-30) -> Dict[str, Dict[str, torch.Tensor]]:
+                                  fisher_eps: float = 1e-30,
+                                  fisher_floor_quantile: float = 0.01) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Compute importance scores for all singular values using LOG-SPACE formula.
 
@@ -1101,6 +1112,8 @@ class FisherAwareSVD:
                                   before combining to reduce offset bias.
             sigma_eps: Numerical floor for σ before log.
             fisher_eps: Numerical floor for Fisher before log.
+            fisher_floor_quantile: Adaptive quantile floor for Fisher per projection.
+                                  q=0.01 means clamp minimum to 1% quantile (or fisher_eps).
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -1126,8 +1139,13 @@ class FisherAwareSVD:
                 if layer_idx in self.fisher_info and name in self.fisher_info[layer_idx]:
                     F = self.fisher_info[layer_idx][name]
 
-                    # Collect Fisher statistics
-                    F_positive = F.clamp(min=fisher_eps)  # Ensure positive for log
+                    # Collect Fisher statistics with adaptive floor to avoid flat clamping.
+                    F_safe = torch.nan_to_num(F.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+                    if 0.0 < fisher_floor_quantile < 1.0:
+                        fisher_floor = max(fisher_eps, torch.quantile(F_safe, fisher_floor_quantile).item())
+                    else:
+                        fisher_floor = fisher_eps
+                    F_positive = F_safe.clamp(min=fisher_floor)  # Ensure positive for log
                     fisher_stats['min'] = min(fisher_stats['min'], F_positive.min().item())
                     fisher_stats['max'] = max(fisher_stats['max'], F_positive.max().item())
                     fisher_stats['mean'] += F_positive.sum().item()
@@ -1159,7 +1177,7 @@ class FisherAwareSVD:
                     scores = sigma_alpha * log_sigma + fisher_lambda * log_fisher
 
                     # Also compute old formula for comparison
-                    old_scores = S.pow(2) * F
+                    old_scores = S.pow(2) * F_safe
                     old_layer_scores[name] = old_scores
 
                     fisher_used += 1
@@ -1200,6 +1218,8 @@ class FisherAwareSVD:
             sigma_stats['mean'] /= sigma_stats['count']
             print(f"  Fisher stats: min={fisher_stats['min']:.2e}, max={fisher_stats['max']:.2e}, mean={fisher_stats['mean']:.2e}")
             print(f"  Sigma stats: min={sigma_stats['min']:.4f}, max={sigma_stats['max']:.4f}, mean={sigma_stats['mean']:.4f}")
+            if 0.0 < fisher_floor_quantile < 1.0:
+                print(f"  Fisher adaptive floor quantile: {fisher_floor_quantile:.1%} (min clamp >= quantile or eps)")
 
             # Dynamic range in log space
             fisher_log_range = torch.log(torch.tensor(fisher_stats['max'])) - torch.log(torch.tensor(fisher_stats['min'] + fisher_eps))
@@ -1244,9 +1264,10 @@ class FisherAwareSVD:
     def phase3_global_truncation(self, ratio: float, min_rank: int = 16,
                                    fisher_lambda: float = 1.0,
                                    sigma_alpha: float = 2.0,
-                                   score_layer_norm: str = "mad",
+                                   score_layer_norm: str = "none",
                                    log_sigma_clip_quantile: float = 0.01,
                                    center_per_projection: bool = False,
+                                   layer_factor_strength: float = 0.0,
                                    use_residual_blocks: bool = True,
                                    block_share: float = 0.1) -> int:
         """
@@ -1269,9 +1290,11 @@ class FisherAwareSVD:
                           Higher values give Fisher more influence.
             sigma_alpha: Weight for singular-value term in log-space formula (default: 2.0)
             score_layer_norm: Layer-wise normalization for scores before global ranking.
-                             Options: "none", "mad", "zscore", "l2" (default: "mad")
+                             Options: "none", "mad", "zscore", "l2" (default: "none")
             log_sigma_clip_quantile: Quantile clipping for log(σ), e.g. 0.01 -> [1%, 99%]
             center_per_projection: Center per-projection log terms before scoring (default: False)
+            layer_factor_strength: Strength of layer position bias in [0, 1].
+                                  0 disables bias; 0.5 gives factor range [0.5, 1.5].
             use_residual_blocks: If True, reserve block_share of budget for blocks
             block_share: Fraction of budget to reserve for blocks (default: 0.1 = 10%)
 
@@ -1304,12 +1327,15 @@ class FisherAwareSVD:
         for layer_idx in importance_scores:
             weighted_scores[layer_idx] = {}
             layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
-            layer_factor = 0.5 + layer_position  # Range: [0.5, 1.5]
+            layer_factor = 1.0 + (2.0 * layer_position - 1.0) * layer_factor_strength
             for name in importance_scores[layer_idx]:
                 weighted_scores[layer_idx][name] = importance_scores[layer_idx][name] * layer_factor
 
         # Print layer factor info for debugging
-        print(f"  Layer factors: L0={0.5:.2f}, L{num_layers//2}={0.5 + 0.5:.2f}, L{num_layers-1}={1.5:.2f}")
+        l0_factor = 1.0 - layer_factor_strength
+        lmid_factor = 1.0
+        llast_factor = 1.0 + layer_factor_strength
+        print(f"  Layer factors (strength={layer_factor_strength:.2f}): L0={l0_factor:.2f}, L{num_layers//2}={lmid_factor:.2f}, L{num_layers-1}={llast_factor:.2f}")
 
         # Collect all scores with their identifiers (layer_idx, name, singular_value_idx)
         # Use normalized scores for ranking but store original scores for debugging
@@ -2781,9 +2807,10 @@ class FisherAwareSVD:
                  min_rank: int = 16,
                  fisher_lambda: float = 1.0,
                  sigma_alpha: float = 2.0,
-                 score_layer_norm: str = "mad",
+                 score_layer_norm: str = "none",
                  log_sigma_clip_quantile: float = 0.01,
                  center_per_projection: bool = False,
+                 layer_factor_strength: float = 0.0,
                  use_als: bool = True,
                  als_iters: int = 2,
                  token_sample_ratio: float = 0.2,
@@ -2820,9 +2847,10 @@ class FisherAwareSVD:
             sigma_alpha: Weight for singular values in log-space formula (default: 2.0)
                         Formula: Score = α × log(σ) + λ × log(F)
             score_layer_norm: Layer-wise normalization before global ranking.
-                             Options: "none", "mad", "zscore", "l2" (default: "mad")
+                             Options: "none", "mad", "zscore", "l2" (default: "none")
             log_sigma_clip_quantile: Quantile clipping for log(σ), default 0.01 -> [1%, 99%]
             center_per_projection: Center per-projection log terms by median (default: False)
+            layer_factor_strength: Cross-layer position bias strength for Phase 3 (default: 0.0)
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
@@ -2877,6 +2905,7 @@ class FisherAwareSVD:
             score_layer_norm=score_layer_norm,
             log_sigma_clip_quantile=log_sigma_clip_quantile,
             center_per_projection=center_per_projection,
+            layer_factor_strength=layer_factor_strength,
             use_residual_blocks=use_residual_blocks, block_share=block_share
         )
 
@@ -3102,7 +3131,7 @@ class FisherAwareSVD:
             subset = find_layers(layer)
             
 
-            # ========== 1-way 分组 ==========
+            # ========== 2-way 分组 ==========
             # Separate projections: attention/gate/up vs down_proj
             attn_mlp_first = []  # q, k, v, o, gate, up
             mlp_down = []  # down_proj
@@ -3111,19 +3140,7 @@ class FisherAwareSVD:
                     if 'down' not in name.lower():
                         attn_mlp_first.append(name)
                     else:
-                        attn_mlp_first.append(name)
-
-
-            # ========== 2-way 分组 ==========
-            # Separate projections: attention/gate/up vs down_proj
-            # attn_mlp_first = []  # q, k, v, o, gate, up
-            # mlp_down = []  # down_proj
-            # for name in subset:
-            #     if name in self.svd_components[layer_idx]:
-            #         if 'down' in name.lower():
-            #             mlp_down.append(name)
-            #         else:
-            #             attn_mlp_first.append(name)
+                        mlp_down.append(name)
 
 
             # # ========== 4-way 分组 ==========
@@ -3770,9 +3787,10 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   min_rank: int = 16,
                                   fisher_lambda: float = 1.0,
                                   sigma_alpha: float = 2.0,
-                                  score_layer_norm: str = "mad",
+                                  score_layer_norm: str = "none",
                                   log_sigma_clip_quantile: float = 0.01,
                                   center_per_projection: bool = False,
+                                  layer_factor_strength: float = 0.0,
                                   use_als: bool = True,
                                   als_iters: int = 2,
                                   token_sample_ratio: float = 0.2,
@@ -3806,9 +3824,10 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         fisher_lambda: Weight for Fisher in log-space formula (default: 1.0)
         sigma_alpha: Weight for singular-value term in log-space formula (default: 2.0)
                     Formula: Score = α × log(σ) + λ × log(F)
-        score_layer_norm: Layer-wise normalization before global ranking
+        score_layer_norm: Layer-wise normalization before global ranking (default: "none")
         log_sigma_clip_quantile: Quantile clipping for log(σ), default 0.01 -> [1%, 99%]
         center_per_projection: Center per-projection log terms by median (default: False)
+        layer_factor_strength: Cross-layer position bias strength for Phase 3 (default: 0.0)
         use_als: Use ALS calibration instead of M-optimization (default: True)
         als_iters: Number of ALS iterations per layer (default: 2)
         token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.2)
@@ -3828,7 +3847,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  Mode: {'Proxy Loss (low resource)' if use_low_resource else 'Cross-Entropy Loss (full)'}")
     print(f"  GPUs: {num_gpus}")
     print(f"  Phase 3 score: {sigma_alpha}×log(σ) + {fisher_lambda}×log(F)")
-    print(f"  Layer score norm: {score_layer_norm}, logσ clip q={log_sigma_clip_quantile}, center={center_per_projection}")
+    print(f"  Layer score norm: {score_layer_norm}, logσ clip q={log_sigma_clip_quantile}, center={center_per_projection}, layer_bias={layer_factor_strength}")
     print(f"  Min rank: {min_rank} (adaptive f_min and max_factor)")
     als_str = f"ALS ({als_iters} iterations, {token_sample_ratio:.0%} tokens)"
     if use_fisher_weight_als:
@@ -3846,6 +3865,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         score_layer_norm=score_layer_norm,
         log_sigma_clip_quantile=log_sigma_clip_quantile,
         center_per_projection=center_per_projection,
+        layer_factor_strength=layer_factor_strength,
         use_als=use_als, als_iters=als_iters,
         token_sample_ratio=token_sample_ratio,
         use_fisher_weight_als=use_fisher_weight_als,
