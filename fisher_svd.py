@@ -1067,7 +1067,9 @@ class FisherAwareSVD:
     def compute_importance_scores(self, fisher_lambda: float = 1.0,
                                   sigma_alpha: float = 2.0,
                                   log_sigma_clip_quantile: float = 0.01,
-                                  center_per_projection: bool = True) -> Dict[str, Dict[str, torch.Tensor]]:
+                                  center_per_projection: bool = False,
+                                  sigma_eps: float = 1e-10,
+                                  fisher_eps: float = 1e-30) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Compute importance scores for all singular values using LOG-SPACE formula.
 
@@ -1097,6 +1099,8 @@ class FisherAwareSVD:
                                     For q=0.01, clip to [1%, 99%]. Set to 0 to disable.
             center_per_projection: If True, subtract per-projection median from log(σ) and log(F)
                                   before combining to reduce offset bias.
+            sigma_eps: Numerical floor for σ before log.
+            fisher_eps: Numerical floor for Fisher before log.
 
         Returns:
             Dictionary of importance scores per layer and sublayer
@@ -1104,9 +1108,6 @@ class FisherAwareSVD:
         importance_scores = {}
         fisher_used = 0
         fisher_fallback = 0
-
-        # Small epsilon to avoid log(0)
-        eps = 1e-10
 
         # Collect statistics for diagnostics
         fisher_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
@@ -1126,14 +1127,14 @@ class FisherAwareSVD:
                     F = self.fisher_info[layer_idx][name]
 
                     # Collect Fisher statistics
-                    F_positive = F.clamp(min=eps)  # Ensure positive for log
+                    F_positive = F.clamp(min=fisher_eps)  # Ensure positive for log
                     fisher_stats['min'] = min(fisher_stats['min'], F_positive.min().item())
                     fisher_stats['max'] = max(fisher_stats['max'], F_positive.max().item())
                     fisher_stats['mean'] += F_positive.sum().item()
                     fisher_stats['count'] += len(F)
 
                     # Collect sigma statistics
-                    S_positive = S.clamp(min=eps)  # Ensure positive for log
+                    S_positive = S.clamp(min=sigma_eps)  # Ensure positive for log
                     sigma_stats['min'] = min(sigma_stats['min'], S_positive.min().item())
                     sigma_stats['max'] = max(sigma_stats['max'], S_positive.max().item())
                     sigma_stats['mean'] += S_positive.sum().item()
@@ -1164,7 +1165,7 @@ class FisherAwareSVD:
                     fisher_used += 1
                 else:
                     # Fallback to log magnitude-based scoring
-                    S_positive = S.clamp(min=eps)
+                    S_positive = S.clamp(min=sigma_eps)
                     log_sigma = torch.log(S_positive)
 
                     if 0.0 < log_sigma_clip_quantile < 0.5:
@@ -1201,8 +1202,8 @@ class FisherAwareSVD:
             print(f"  Sigma stats: min={sigma_stats['min']:.4f}, max={sigma_stats['max']:.4f}, mean={sigma_stats['mean']:.4f}")
 
             # Dynamic range in log space
-            fisher_log_range = torch.log(torch.tensor(fisher_stats['max'])) - torch.log(torch.tensor(fisher_stats['min'] + eps))
-            sigma_log_range = torch.log(torch.tensor(sigma_stats['max'])) - torch.log(torch.tensor(sigma_stats['min'] + eps))
+            fisher_log_range = torch.log(torch.tensor(fisher_stats['max'])) - torch.log(torch.tensor(fisher_stats['min'] + fisher_eps))
+            sigma_log_range = torch.log(torch.tensor(sigma_stats['max'])) - torch.log(torch.tensor(sigma_stats['min'] + sigma_eps))
             print(f"  Log-space ranges: log(σ) range={sigma_log_range.item():.1f}, log(F) range={fisher_log_range.item():.1f}")
             print(f"  Effective sigma influence: {sigma_alpha} × {sigma_log_range.item():.1f} = {sigma_alpha * sigma_log_range.item():.1f}")
             print(f"  Effective Fisher influence: {fisher_lambda} × {fisher_log_range.item():.1f} = {fisher_lambda * fisher_log_range.item():.1f}")
@@ -1245,7 +1246,7 @@ class FisherAwareSVD:
                                    sigma_alpha: float = 2.0,
                                    score_layer_norm: str = "mad",
                                    log_sigma_clip_quantile: float = 0.01,
-                                   center_per_projection: bool = True,
+                                   center_per_projection: bool = False,
                                    use_residual_blocks: bool = True,
                                    block_share: float = 0.1) -> int:
         """
@@ -1270,7 +1271,7 @@ class FisherAwareSVD:
             score_layer_norm: Layer-wise normalization for scores before global ranking.
                              Options: "none", "mad", "zscore", "l2" (default: "mad")
             log_sigma_clip_quantile: Quantile clipping for log(σ), e.g. 0.01 -> [1%, 99%]
-            center_per_projection: Center per-projection log terms before scoring
+            center_per_projection: Center per-projection log terms before scoring (default: False)
             use_residual_blocks: If True, reserve block_share of budget for blocks
             block_share: Fraction of budget to reserve for blocks (default: 0.1 = 10%)
 
@@ -2782,7 +2783,7 @@ class FisherAwareSVD:
                  sigma_alpha: float = 2.0,
                  score_layer_norm: str = "mad",
                  log_sigma_clip_quantile: float = 0.01,
-                 center_per_projection: bool = True,
+                 center_per_projection: bool = False,
                  use_als: bool = True,
                  als_iters: int = 2,
                  token_sample_ratio: float = 0.2,
@@ -2821,7 +2822,7 @@ class FisherAwareSVD:
             score_layer_norm: Layer-wise normalization before global ranking.
                              Options: "none", "mad", "zscore", "l2" (default: "mad")
             log_sigma_clip_quantile: Quantile clipping for log(σ), default 0.01 -> [1%, 99%]
-            center_per_projection: Center per-projection log terms by median (default: True)
+            center_per_projection: Center per-projection log terms by median (default: False)
             use_als: Use ALS calibration instead of M-optimization (default: True)
             als_iters: Number of ALS iterations per layer (default: 2)
             token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.1)
@@ -3771,7 +3772,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   sigma_alpha: float = 2.0,
                                   score_layer_norm: str = "mad",
                                   log_sigma_clip_quantile: float = 0.01,
-                                  center_per_projection: bool = True,
+                                  center_per_projection: bool = False,
                                   use_als: bool = True,
                                   als_iters: int = 2,
                                   token_sample_ratio: float = 0.2,
@@ -3807,7 +3808,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                     Formula: Score = α × log(σ) + λ × log(F)
         score_layer_norm: Layer-wise normalization before global ranking
         log_sigma_clip_quantile: Quantile clipping for log(σ), default 0.01 -> [1%, 99%]
-        center_per_projection: Center per-projection log terms by median
+        center_per_projection: Center per-projection log terms by median (default: False)
         use_als: Use ALS calibration instead of M-optimization (default: True)
         als_iters: Number of ALS iterations per layer (default: 2)
         token_sample_ratio: Ratio of tokens to sample per sequence for ALS (default: 0.2)

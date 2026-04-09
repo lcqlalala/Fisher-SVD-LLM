@@ -532,8 +532,10 @@ if __name__ == '__main__':
                         help='Layer-wise score normalization before global rank allocation (default: mad)')
     parser.add_argument('--log_sigma_clip_q', type=float, default=0.01,
                         help='Quantile clipping for log(σ): q -> [q, 1-q], set 0 to disable (default: 0.01)')
+    parser.add_argument('--score_center', action='store_true',
+                        help='Enable per-projection median centering for log(σ)/log(F) (default: disabled)')
     parser.add_argument('--no_score_center', action='store_true',
-                        help='Disable per-projection median centering for log(σ)/log(F)')
+                        help='Disable per-projection median centering for log(σ)/log(F) (overrides --score_center)')
     # NOTE: max_rank_ratio is now adaptive (entropy-based), no longer needs manual tuning
     parser.add_argument('--use_als', action='store_true', default=True, help='Use ALS calibration in Phase 4 (default: True)')
     parser.add_argument('--no_als', action='store_true', help='Disable ALS calibration, use M-optimization instead')
@@ -671,7 +673,7 @@ if __name__ == '__main__':
             sigma_alpha=args.sigma_alpha,
             score_layer_norm=args.score_layer_norm,
             log_sigma_clip_quantile=args.log_sigma_clip_q,
-            center_per_projection=not args.no_score_center,
+            center_per_projection=(args.score_center and not args.no_score_center),
             use_als=args.use_als,
             als_iters=args.als_iters,
             token_sample_ratio=args.token_sample_ratio,
