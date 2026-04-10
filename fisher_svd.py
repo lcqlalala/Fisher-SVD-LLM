@@ -788,9 +788,16 @@ class FisherAwareSVD:
         else:
             self.model = self.model.to(self.device)
 
-        # Use eval mode for deterministic statistics (no dropout),
-        # while still enabling gradients for Fisher estimation.
-        self.model.eval()
+        # IMPORTANT FOR MEMORY:
+        # Many HF implementations only apply gradient checkpointing when model.training=True.
+        # Run in train mode to ensure checkpointing is active, but disable dropout to keep
+        # Fisher statistics deterministic.
+        self.model.train()
+        dropout_backup = []
+        for module in self.model.modules():
+            if isinstance(module, nn.Dropout) and module.p != 0.0:
+                dropout_backup.append((module, module.p))
+                module.p = 0.0
 
         # Enable gradient checkpointing to save memory
         if hasattr(self.model, 'gradient_checkpointing_enable'):
@@ -820,7 +827,7 @@ class FisherAwareSVD:
                 single_sample = {k: v[sample_idx:sample_idx+1] for k, v in batch.items()}
 
                 # Zero gradients
-                self.model.zero_grad()
+                self.model.zero_grad(set_to_none=True)
 
                 try:
                     # Forward pass with cross-entropy loss for single sample
@@ -852,7 +859,7 @@ class FisherAwareSVD:
 
                 except RuntimeError as e:
                     if "out of memory" in str(e):
-                        print(f"  Warning: OOM at sample {num_samples}, skipping...")
+                        print(f"  Warning: OOM at batch sample {sample_idx} (accepted={num_samples}), skipping...")
                         torch.cuda.empty_cache()
                         continue
                     else:
@@ -875,6 +882,8 @@ class FisherAwareSVD:
         else:
             print("  Warning: No samples processed successfully.")
             print("  Falling back to proxy loss estimation...")
+            for module, p in dropout_backup:
+                module.p = p
             self._restore_original_layers()
             self._collect_model_to_cpu()
             if hasattr(self.model, 'gradient_checkpointing_disable'):
@@ -886,6 +895,10 @@ class FisherAwareSVD:
         # Disable gradient checkpointing
         if hasattr(self.model, 'gradient_checkpointing_disable'):
             self.model.gradient_checkpointing_disable()
+
+        # Restore dropout probabilities before leaving Phase 2.
+        for module, p in dropout_backup:
+            module.p = p
 
         # Restore original model
         self._restore_original_layers()
