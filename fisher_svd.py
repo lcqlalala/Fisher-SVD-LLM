@@ -807,6 +807,7 @@ class FisherAwareSVD:
         # Accumulate Fisher information with PER-SAMPLE gradients
         num_samples = 0
         total_loss = 0.0
+        total_tokens = 0
         target_device = self.devices[0] if self.use_multi_gpu else self.device
 
         for batch in tqdm(calib_loader):
@@ -823,7 +824,10 @@ class FisherAwareSVD:
 
                 try:
                     # Forward pass with cross-entropy loss for single sample
-                    outputs = self.model(**single_sample, labels=single_sample['input_ids'])
+                    labels = single_sample['input_ids'].clone()
+                    if 'attention_mask' in single_sample:
+                        labels = labels.masked_fill(single_sample['attention_mask'] == 0, -100)
+                    outputs = self.model(**single_sample, labels=labels, use_cache=False)
                     loss = outputs.loss
                     # Scale CE mean loss back to token-sum scale to reduce tiny-gradient underflow.
                     if 'attention_mask' in single_sample:
@@ -832,6 +836,7 @@ class FisherAwareSVD:
                         token_count = max(1, single_sample['input_ids'].numel() - 1)
                     loss = loss * token_count
                     total_loss += loss.item()
+                    total_tokens += token_count
 
                     # Backward pass
                     loss.backward()
@@ -863,8 +868,10 @@ class FisherAwareSVD:
                     self.fisher_info[layer_idx][name] /= num_samples
                     self.fisher_info[layer_idx][name] = self.fisher_info[layer_idx][name].float()
 
-            avg_loss = total_loss / num_samples
-            print(f"  Average calibration loss: {avg_loss:.4f}")
+            avg_loss_scaled = total_loss / num_samples
+            avg_loss_token = total_loss / max(1, total_tokens)
+            print(f"  Average calibration loss (scaled per-sample): {avg_loss_scaled:.4f}")
+            print(f"  Average calibration loss (per-token CE): {avg_loss_token:.4f}")
         else:
             print("  Warning: No samples processed successfully.")
             print("  Falling back to proxy loss estimation...")
@@ -1322,14 +1329,19 @@ class FisherAwareSVD:
 
         num_layers = len(self.layers)
 
-        # Apply layer position factor after normalization.
+        # Base scores for allocation constraints/concentration.
+        # Keep this free from layer position bias to avoid coupling layer_factor
+        # into entropy-based max_factor.
+        base_scores = importance_scores
+
+        # Apply layer position factor only for global marginal-utility ranking.
         weighted_scores = {}
-        for layer_idx in importance_scores:
+        for layer_idx in base_scores:
             weighted_scores[layer_idx] = {}
             layer_position = layer_idx / (num_layers - 1) if num_layers > 1 else 0.5
             layer_factor = 1.0 + (2.0 * layer_position - 1.0) * layer_factor_strength
-            for name in importance_scores[layer_idx]:
-                weighted_scores[layer_idx][name] = importance_scores[layer_idx][name] * layer_factor
+            for name in base_scores[layer_idx]:
+                weighted_scores[layer_idx][name] = base_scores[layer_idx][name] * layer_factor
 
         # Print layer factor info for debugging
         l0_factor = 1.0 - layer_factor_strength
@@ -1399,8 +1411,10 @@ class FisherAwareSVD:
                 original_rank = len(S)
                 total_original_params += m * n
 
-                # Get importance scores for this projection
+                # Scores used for greedy ranking (with optional layer bias)
                 scores = weighted_scores[layer_idx][name]
+                # Scores used for entropy concentration/max allocation (without layer bias)
+                base_score = base_scores[layer_idx][name]
 
                 # Pre-compute uniform rank for this projection
                 uniform_rank = int(m * n * ratio / (m + n))
@@ -1412,6 +1426,7 @@ class FisherAwareSVD:
                     'cost': m + n,  # Cost per singular value
                     'original_rank': original_rank,
                     'scores': scores,
+                    'base_scores': base_score,
                     'uniform_rank': uniform_rank  # Pre-computed for binary search
                 }
 
@@ -1450,7 +1465,7 @@ class FisherAwareSVD:
         projection_concentration = {}
 
         for key, info in projection_info.items():
-            scores = info['scores']
+            scores = info['base_scores']
 
             # IMPORTANT: scores are in LOG-SPACE (log(σ) + λ*log(F))
             # They can be negative! Use softmax to convert to probability distribution
@@ -1842,42 +1857,55 @@ class FisherAwareSVD:
 
         print(f"  Total singular values kept: {kept_count}")
 
-        # Analyze allocation distribution
+        # Analyze allocation distribution (PARAMETER budget, consistent with guardrail)
         layer_allocation = {}
-        layer_target_rank = {}  # For comparison
 
         for layer_idx in self.svd_components:
-            layer_total = 0
-            layer_target = 0
+            layer_total_params = 0
+            layer_uniform_params = 0
             for name in self.svd_components[layer_idx]:
                 key = (layer_idx, name)
                 info = projection_info[key]
-                m, n = info['m'], info['n']
-                # What would uniform allocation give?
-                uniform_rank = int(m * n * ratio / (m + n))
-                uniform_rank = max(min_rank, min(uniform_rank, info['original_rank']))
+                cost = info['cost']
+                uniform_rank = max(min_rank, min(info['uniform_rank'], info['original_rank']))
 
-                layer_total += layer_allocated_rank[key]
-                layer_target += uniform_rank
-                layer_target_rank[key] = uniform_rank
+                layer_total_params += layer_allocated_rank[key] * cost
+                layer_uniform_params += uniform_rank * cost
 
-            layer_allocation[layer_idx] = (layer_total, layer_target)
+            layer_allocation[layer_idx] = (layer_total_params, layer_uniform_params)
 
-        # Print allocation analysis
-        under_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual < target * 0.9)
-        over_target = sum(1 for l, (actual, target) in layer_allocation.items() if actual > target * 1.1)
+        # Print allocation analysis with the SAME guardrail thresholds
+        under_target = sum(
+            1 for _, (actual, target) in layer_allocation.items()
+            if actual < target * layer_guard_min_ratio
+        )
+        over_target = sum(
+            1 for _, (actual, target) in layer_allocation.items()
+            if actual > target * layer_guard_max_ratio
+        )
         at_target = len(layer_allocation) - under_target - over_target
-        print(f"  Allocation: {under_target} layers <90%, {at_target} ~100%, {over_target} >110% of uniform")
+        print(
+            f"  Allocation (param budget): {under_target} layers <{layer_guard_min_ratio:.0%}, "
+            f"{at_target} in-range, {over_target} >{layer_guard_max_ratio:.0%} of uniform"
+        )
 
         # Show extreme examples
         if layer_allocation:
-            sorted_layers = sorted(layer_allocation.items(),
-                                   key=lambda x: x[1][0]/x[1][1] if x[1][1] > 0 else 0)
+            sorted_layers = sorted(
+                layer_allocation.items(),
+                key=lambda x: x[1][0] / x[1][1] if x[1][1] > 0 else 0
+            )
             if len(sorted_layers) >= 2:
                 min_layer, (min_actual, min_target) = sorted_layers[0]
                 max_layer, (max_actual, max_target) = sorted_layers[-1]
-                print(f"  Layer {min_layer}: {min_actual}/{min_target} ({min_actual/min_target*100:.0f}% of uniform)")
-                print(f"  Layer {max_layer}: {max_actual}/{max_target} ({max_actual/max_target*100:.0f}% of uniform)")
+                print(
+                    f"  Layer {min_layer}: {min_actual:,}/{min_target:,} "
+                    f"({min_actual / max(min_target, 1) * 100:.0f}% of uniform params)"
+                )
+                print(
+                    f"  Layer {max_layer}: {max_actual:,}/{max_target:,} "
+                    f"({max_actual / max(max_target, 1) * 100:.0f}% of uniform params)"
+                )
 
         # Truncate SVD components
         truncation_samples = []
@@ -1912,9 +1940,9 @@ class FisherAwareSVD:
 
                 self.svd_components[layer_idx][name] = (U_trunc, S_trunc, VT_trunc, bias)
 
-        # Analyze which singular value indices are kept
-        # If Fisher works, it might keep non-contiguous indices (not just top-k)
-        # If it keeps mostly contiguous top indices, Fisher isn't adding value
+        # Analyze selection pattern.
+        # NOTE: Current allocator enforces contiguous prefixes by design (0..k-1),
+        # so non-contiguous selections are not expected unless allocation strategy changes.
         contiguous_count = 0
         non_contiguous_count = 0
         total_projections = 0
@@ -1933,7 +1961,7 @@ class FisherAwareSVD:
 
         contiguous_pct = contiguous_count / total_projections * 100 if total_projections > 0 else 0
         print(f"  Selection pattern: {contiguous_pct:.1f}% contiguous (top-k), {100-contiguous_pct:.1f}% non-contiguous")
-        print(f"    (100% contiguous = Fisher not helping, just keeping top singular values)")
+        print(f"    (Current Phase 3 allocator is prefix-contiguous by construction)")
 
         # Print truncation samples
         print("  Truncation examples:")
