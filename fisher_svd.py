@@ -1660,204 +1660,6 @@ class FisherAwareSVD:
         print(f"  Greedy allocations: {allocations_made}")
         print(f"  Final params: {current_params:,} ({current_params/total_original_params*100:.2f}%)")
 
-        # Step 5.5: Layer budget guardrails (post-greedy rebalancing)
-        # Keep each layer close to its uniform budget to avoid early-layer starvation.
-        layer_guard_min_ratio = 0.90
-        layer_guard_max_ratio = 1.25
-
-        layer_keys = defaultdict(list)
-        for key in projection_info:
-            layer_keys[key[0]].append(key)
-
-        layer_uniform_params = {}
-        layer_params = {}
-        for layer_idx, keys in layer_keys.items():
-            uniform_params = 0
-            current_layer_params = 0
-            for key in keys:
-                info = projection_info[key]
-                uniform_rank = max(min_rank, min(info['uniform_rank'], info['original_rank']))
-                uniform_params += uniform_rank * info['cost']
-                current_layer_params += layer_allocated_rank[key] * info['cost']
-            layer_uniform_params[layer_idx] = uniform_params
-            layer_params[layer_idx] = current_layer_params
-
-        layer_min_params = {
-            layer_idx: int(layer_uniform_params[layer_idx] * layer_guard_min_ratio)
-            for layer_idx in layer_uniform_params
-        }
-        layer_max_params = {
-            layer_idx: int(layer_uniform_params[layer_idx] * layer_guard_max_ratio)
-            for layer_idx in layer_uniform_params
-        }
-
-        def count_layer_violations():
-            under = 0
-            over = 0
-            for layer_idx in layer_params:
-                if layer_params[layer_idx] < layer_min_params[layer_idx]:
-                    under += 1
-                elif layer_params[layer_idx] > layer_max_params[layer_idx]:
-                    over += 1
-            return under, over
-
-        def get_worst_remove_candidate(layer_filter=None, exclude_layers=None, require_above_min=True):
-            """
-            Find the removable singular value with the lowest utility/cost.
-            """
-            worst = None
-            worst_priority = float("inf")
-
-            for layer_idx, keys in layer_keys.items():
-                if layer_filter is not None and layer_idx != layer_filter:
-                    continue
-                if exclude_layers is not None and layer_idx in exclude_layers:
-                    continue
-
-                for key in keys:
-                    k = layer_allocated_rank[key]
-                    if k <= projection_min_rank[key]:
-                        continue
-
-                    info = projection_info[key]
-                    cost = info['cost']
-                    if require_above_min and (layer_params[layer_idx] - cost < layer_min_params[layer_idx]):
-                        continue
-
-                    score = info['scores'][k - 1].item()
-                    priority = score / cost
-                    if priority < worst_priority:
-                        worst_priority = priority
-                        worst = (layer_idx, key)
-
-            return worst
-
-        def get_best_add_candidate(layer_idx):
-            """
-            Find the best next singular value for a specific layer by utility/cost.
-            """
-            best = None
-            best_priority = -float("inf")
-            for key in layer_keys[layer_idx]:
-                k = layer_allocated_rank[key]
-                if k >= projection_max_rank[key]:
-                    continue
-                info = projection_info[key]
-                cost = info['cost']
-                score = info['scores'][k].item()
-                priority = score / cost
-                if priority > best_priority:
-                    best_priority = priority
-                    best = key
-            return best
-
-        def get_best_global_add_candidate():
-            """
-            Best add candidate while respecting layer max guardrail and total budget.
-            """
-            best = None
-            best_priority = -float("inf")
-            for layer_idx, keys in layer_keys.items():
-                for key in keys:
-                    k = layer_allocated_rank[key]
-                    if k >= projection_max_rank[key]:
-                        continue
-                    info = projection_info[key]
-                    cost = info['cost']
-                    if current_params + cost > target_params:
-                        continue
-                    if layer_params[layer_idx] + cost > layer_max_params[layer_idx]:
-                        continue
-
-                    score = info['scores'][k].item()
-                    priority = score / cost
-                    if priority > best_priority:
-                        best_priority = priority
-                        best = (layer_idx, key)
-            return best
-
-        def apply_remove(layer_idx, key):
-            nonlocal current_params
-            info = projection_info[key]
-            layer_allocated_rank[key] -= 1
-            current_params -= info['cost']
-            layer_params[layer_idx] -= info['cost']
-
-        def apply_add(layer_idx, key):
-            nonlocal current_params
-            info = projection_info[key]
-            layer_allocated_rank[key] += 1
-            current_params += info['cost']
-            layer_params[layer_idx] += info['cost']
-
-        under_before, over_before = count_layer_violations()
-        removed_for_max = 0
-        moved_for_min = 0
-        refill_additions = 0
-
-        # 5.5a: Clamp over-allocated layers to max guardrail first.
-        for layer_idx in sorted(layer_params.keys()):
-            while layer_params[layer_idx] > layer_max_params[layer_idx]:
-                cand = get_worst_remove_candidate(layer_filter=layer_idx, require_above_min=True)
-                if cand is None:
-                    break
-                _, key = cand
-                apply_remove(layer_idx, key)
-                removed_for_max += 1
-
-        # 5.5b: Raise under-allocated layers to min guardrail (steal budget if needed).
-        rebalance_steps = 0
-        max_rebalance_steps = 200000
-        under_layers = sorted(layer_params.keys(), key=lambda l: layer_params[l] - layer_min_params[l])
-
-        for layer_idx in under_layers:
-            while layer_params[layer_idx] < layer_min_params[layer_idx] and rebalance_steps < max_rebalance_steps:
-                add_key = get_best_add_candidate(layer_idx)
-                if add_key is None:
-                    break
-
-                add_cost = projection_info[add_key]['cost']
-
-                # Ensure budget room: remove low-utility SVs from donor layers if needed.
-                while current_params + add_cost > target_params:
-                    donor = get_worst_remove_candidate(exclude_layers={layer_idx}, require_above_min=True)
-                    if donor is None:
-                        break
-                    donor_layer, donor_key = donor
-                    apply_remove(donor_layer, donor_key)
-                    moved_for_min += 1
-                    rebalance_steps += 1
-
-                if current_params + add_cost > target_params:
-                    break
-
-                apply_add(layer_idx, add_key)
-                moved_for_min += 1
-                rebalance_steps += 1
-
-        # 5.5c: Refill remaining global budget with best candidates under max guardrails.
-        refill_steps = 0
-        max_refill_steps = 200000
-        while current_params < target_params and refill_steps < max_refill_steps:
-            best_add = get_best_global_add_candidate()
-            if best_add is None:
-                break
-            add_layer, add_key = best_add
-            apply_add(add_layer, add_key)
-            refill_additions += 1
-            refill_steps += 1
-
-        under_after, over_after = count_layer_violations()
-        print(
-            f"  Layer guardrail [{layer_guard_min_ratio:.0%}, {layer_guard_max_ratio:.0%}] "
-            f"violations: under {under_before}->{under_after}, over {over_before}->{over_after}"
-        )
-        print(
-            f"  Layer rebalance ops: remove_for_max={removed_for_max}, "
-            f"move_for_min={moved_for_min}, refill={refill_additions}"
-        )
-        print(f"  Params after guardrail: {current_params:,} ({current_params/total_original_params*100:.2f}%)")
-
         # Step 6: Build kept_indices (always contiguous: 0 to k-1)
         kept_indices: Dict[int, Dict[str, set]] = defaultdict(lambda: defaultdict(set))
         kept_count = 0
@@ -1870,7 +1672,7 @@ class FisherAwareSVD:
 
         print(f"  Total singular values kept: {kept_count}")
 
-        # Analyze allocation distribution (PARAMETER budget, consistent with guardrail)
+        # Analyze allocation distribution (PARAMETER budget vs uniform)
         layer_allocation = {}
 
         for layer_idx in self.svd_components:
@@ -1887,19 +1689,21 @@ class FisherAwareSVD:
 
             layer_allocation[layer_idx] = (layer_total_params, layer_uniform_params)
 
-        # Print allocation analysis with the SAME guardrail thresholds
+        # Print allocation analysis
+        analysis_under_ratio = 0.90
+        analysis_over_ratio = 1.10
         under_target = sum(
             1 for _, (actual, target) in layer_allocation.items()
-            if actual < target * layer_guard_min_ratio
+            if actual < target * analysis_under_ratio
         )
         over_target = sum(
             1 for _, (actual, target) in layer_allocation.items()
-            if actual > target * layer_guard_max_ratio
+            if actual > target * analysis_over_ratio
         )
         at_target = len(layer_allocation) - under_target - over_target
         print(
-            f"  Allocation (param budget): {under_target} layers <{layer_guard_min_ratio:.0%}, "
-            f"{at_target} in-range, {over_target} >{layer_guard_max_ratio:.0%} of uniform"
+            f"  Allocation (param budget): {under_target} layers <{analysis_under_ratio:.0%}, "
+            f"{at_target} ~100%, {over_target} >{analysis_over_ratio:.0%} of uniform"
         )
 
         # Show extreme examples
