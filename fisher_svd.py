@@ -253,9 +253,15 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
     VT_f = VT.float()
     W_f = W.float()
 
-    # Pre-compute importance weights per row-tile and col-tile
+    # Pre-compute importance weights per row-tile and col-tile.
+    # Normalize Fisher scales within each projection to reduce cross-layer
+    # score mismatch in global selection.
     if use_fisher_weight and row_importance is not None:
-        imp_row = row_importance.float().to(device)
+        imp_row = torch.nan_to_num(
+            row_importance.float().to(device), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(min=0.0)
+        row_scale = imp_row.median().clamp(min=1e-12)
+        imp_row = (imp_row / row_scale).clamp(min=0.1, max=10.0)
         row_weights = torch.zeros(n_row_tiles, device=device, dtype=torch.float32)
         for ri in range(n_row_tiles):
             row_start = ri * b
@@ -265,7 +271,11 @@ def select_residual_blocks(W: torch.Tensor, U: torch.Tensor, S: torch.Tensor,
         row_weights = torch.ones(n_row_tiles, device=device, dtype=torch.float32)
 
     if use_fisher_weight and col_importance is not None:
-        imp_col = col_importance.float().to(device)
+        imp_col = torch.nan_to_num(
+            col_importance.float().to(device), nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(min=0.0)
+        col_scale = imp_col.median().clamp(min=1e-12)
+        imp_col = (imp_col / col_scale).clamp(min=0.1, max=10.0)
         col_weights = torch.zeros(n_col_tiles, device=device, dtype=torch.float32)
         for ci in range(n_col_tiles):
             col_start = ci * b
@@ -1882,8 +1892,9 @@ class FisherAwareSVD:
         estimated_max_candidates = num_projections * max_cand_per_proj
         print(f"  Projections: {num_projections}, max candidates ~{estimated_max_candidates:,}")
 
-        # Candidate cap per projection: 2x fair share (to allow some flexibility)
-        cand_cap_per_proj = max(100, (total_block_budget * 2) // max(1, num_projections))
+        # Candidate cap per projection: 5x fair share to avoid clipping layers
+        # that truly need more residual blocks.
+        cand_cap_per_proj = max(100, (total_block_budget * 5) // max(1, num_projections))
 
         # Use a min-heap to keep top-K globally
         # Heap stores (score, counter, block) - counter breaks ties to avoid dict comparison
@@ -1919,20 +1930,57 @@ class FisherAwareSVD:
                 S_gpu = S.to(device)
                 VT_gpu = VT.to(device)
 
-                # Get importance weights from Fisher if available
-                # Extract BOTH row (output) and column (input) importance
+                # Get importance weights from Fisher if available.
+                # Extract BOTH row (output) and column (input) importance.
+                #
+                # Important:
+                # - fisher can be full weight-space [out, in], OR
+                # - fisher can be singular-value space [rank] (from Phase 2).
+                # For [rank], project it back to row/col importance:
+                #   row ≈ (U^2 @ F_sigma), col ≈ (V^2 @ F_sigma), V = VT^T.
                 row_importance = None
                 col_importance = None
                 if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
                     if name in self.fisher_info[layer_idx]:
                         fisher = self.fisher_info[layer_idx][name]
-                        if len(fisher.shape) == 2:
-                            # Fisher is [out, in], get both dimensions
-                            row_importance = fisher.sum(dim=1).to(device)  # Sum over columns -> [out]
-                            col_importance = fisher.sum(dim=0).to(device)  # Sum over rows -> [in]
+
+                        if fisher.dim() == 2 and fisher.shape[0] == W_gpu.shape[0] and fisher.shape[1] == W_gpu.shape[1]:
+                            # Full weight-space Fisher [out, in]
+                            row_importance = fisher.sum(dim=1).float().to(device)
+                            col_importance = fisher.sum(dim=0).float().to(device)
                         else:
-                            # 1D Fisher, assume it's row importance
-                            row_importance = fisher.to(device)
+                            # Sigma-space Fisher [rank] or square matrix in sigma-space.
+                            F_sigma = None
+                            if fisher.dim() == 1:
+                                F_sigma = fisher.float().to(device)
+                            elif fisher.dim() == 2 and fisher.shape[0] == fisher.shape[1]:
+                                F_sigma = fisher.diag().float().to(device)
+
+                            if F_sigma is not None:
+                                r = min(
+                                    int(F_sigma.numel()),
+                                    int(S_gpu.shape[0]),
+                                    int(U_gpu.shape[1]),
+                                    int(VT_gpu.shape[0]),
+                                )
+                                if r > 0:
+                                    F_sigma = torch.nan_to_num(
+                                        F_sigma[:r], nan=0.0, posinf=0.0, neginf=0.0
+                                    ).clamp(min=0.0)
+                                    U_r = U_gpu[:, :r].float()
+                                    V_r = VT_gpu[:r, :].T.float()
+                                    row_importance = (U_r.pow(2) * F_sigma.unsqueeze(0)).sum(dim=1)
+                                    col_importance = (V_r.pow(2) * F_sigma.unsqueeze(0)).sum(dim=1)
+                                    del U_r, V_r
+
+                        if row_importance is not None:
+                            row_importance = torch.nan_to_num(
+                                row_importance, nan=0.0, posinf=0.0, neginf=0.0
+                            ).clamp(min=0.0)
+                        if col_importance is not None:
+                            col_importance = torch.nan_to_num(
+                                col_importance, nan=0.0, posinf=0.0, neginf=0.0
+                            ).clamp(min=0.0)
 
                 # Select candidate blocks for this projection with layer_factor
                 blocks = select_residual_blocks(
@@ -3625,172 +3673,201 @@ class FisherAwareSVD:
                 continue
 
             subset = find_layers(layer)
-            layer_inputs = {name: [] for name in subset}
-            handles = []
 
-            def make_hook(name):
-                def hook(module, inp, out):
-                    x = inp[0].detach().float()
-                    if x.dim() == 2:
-                        T = x.shape[0]
-                        if T > tokens_per_seq:
-                            idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
-                            x = x.index_select(0, idx)
+            # Two-way grouping:
+            # 1) attention + gate/up
+            # 2) down_proj (requires fresh capture after first group updates)
+            attn_mlp_first = []
+            mlp_down = []
+            for name in subset:
+                if name in self.svd_components[layer_idx]:
+                    if 'down' not in name.lower():
+                        attn_mlp_first.append(name)
+                    else:
+                        mlp_down.append(name)
+
+            def calibrate_projections_with_blocks(proj_names: List[str]) -> Tuple[float, int]:
+                if not proj_names:
+                    return 0.0, 0
+
+                layer_inputs = {name: [] for name in proj_names}
+                handles = []
+
+                def make_hook(name):
+                    def hook(module, inp, out):
+                        x = inp[0].detach().float()
+                        if x.dim() == 2:
+                            T = x.shape[0]
+                            if T > tokens_per_seq:
+                                idx = torch.randperm(T, device=x.device)[:tokens_per_seq]
+                                x = x.index_select(0, idx)
+                            layer_inputs[name].append(x.cpu())
+                            return
+                        if x.shape[1] > tokens_per_seq:
+                            indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
+                            x = x[:, indices, :]
                         layer_inputs[name].append(x.cpu())
-                        return
-                    if x.shape[1] > tokens_per_seq:
-                        indices = torch.randperm(x.shape[1], device=x.device)[:tokens_per_seq]
-                        x = x[:, indices, :]
-                    layer_inputs[name].append(x.cpu())
-                return hook
+                    return hook
 
-            for name in subset:
-                handle = subset[name].register_forward_hook(make_hook(name))
-                handles.append(handle)
+                # Capture fresh inputs for this projection group
+                for name in proj_names:
+                    linear = self._get_module_by_name(layer, name)
+                    handle = linear.register_forward_hook(make_hook(name))
+                    handles.append(handle)
 
-            with torch.no_grad():
-                for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
-                    if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
-                        _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
-                    else:
-                        _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
-
-            for handle in handles:
-                handle.remove()
-
-            # Calibrate each projection with block adjustment
-            for name in subset:
-                key = (layer_idx, name)
-                if name not in self.svd_components[layer_idx] or len(layer_inputs.get(name, [])) == 0:
-                    continue
-
-                U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
-                rank = len(S_r)
-                original_linear = self._get_module_by_name(layer, name)
-
-                X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
-                del layer_inputs[name]
-
-                # Original target
-                W_orig = original_linear.weight.data.float().to(self.device)
-                Y_orig = X @ W_orig.T
-
-                # Compute block contribution and subtract from target
-                Y_blocks = torch.zeros_like(Y_orig)
-                if key in self.residual_blocks:
-                    for block in self.residual_blocks[key]:
-                        row, col = block['row'], block['col']
-                        row_end, col_end = block['row_end'], block['col_end']
-                        B_val = block['val'].float().to(self.device)
-                        # Block contribution: X[:, col:col_end] @ B_val.T -> Y[:, row:row_end]
-                        Y_blocks[:, row:row_end] += X[:, col:col_end] @ B_val.T
-
-                # Adjusted target: what SVD needs to approximate
-                Y = Y_orig - Y_blocks
-
-                # SVD components
-                U = U_r.float().to(self.device)
-                S = S_r.float().to(self.device)
-                V = VT_r.T.float().to(self.device)
-
-                # Loss before
-                W_before = (U * S) @ VT_r.float().to(self.device)
-                loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
-
-                if loss_before < 1e-6:
-                    del X, W_orig, Y_orig, Y_blocks, Y, U, S, V, W_before
-                    torch.cuda.empty_cache()
-                    continue
-
-                reg = 1e-6
-
-                # Compute Fisher weights if enabled
-                F_y = None
-                if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
-                    if name in self.fisher_info[layer_idx]:
-                        fisher_raw = self.fisher_info[layer_idx][name]
-                        if fisher_raw.dim() == 1:
-                            F_sigma = fisher_raw.float().to(self.device)
-                        elif fisher_raw.dim() == 2:
-                            if fisher_raw.shape[0] == fisher_raw.shape[1]:
-                                F_sigma = fisher_raw.diag().float().to(self.device)
-                            else:
-                                F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                with torch.no_grad():
+                    for j in range(inps.shape[0]):
+                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        if position_ids is not None and "opt" not in self.model_name:
+                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
                         else:
-                            F_sigma = None
+                            _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
 
-                        if F_sigma is not None and len(F_sigma) >= rank:
-                            F_sigma = F_sigma[:rank]
-                            F_y = (U ** 2) @ F_sigma
-                            F_y = F_y / (F_y.mean() + 1e-10)
-                            F_y = F_y.clamp(min=0.01, max=100.0)
-                            del F_sigma
+                for handle in handles:
+                    handle.remove()
 
-                # ALS iterations
-                for _ in range(num_iters):
-                    # Step A: Fix V, S, solve U (Fisher does not affect)
-                    Z = (X @ V) * S
-                    U_T_new = torch.linalg.lstsq(Z, Y).solution
-                    U = U_T_new.T
-                    del Z, U_T_new
+                proj_improvement = 0.0
+                proj_count = 0
 
-                    # Step B: Fix U, S, solve V (with Fisher weighting)
-                    U_s = U * S
-                    if F_y is not None:
-                        F_U_s = U_s * F_y.unsqueeze(1)
-                        G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
-                        Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T
-                        del F_U_s
-                    else:
-                        G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
-                        Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T
-                    V = torch.linalg.lstsq(X, Z_target).solution
-                    del U_s, G, Z_target
+                # Calibrate each projection with block-adjusted target
+                for name in proj_names:
+                    key = (layer_idx, name)
+                    if len(layer_inputs.get(name, [])) == 0:
+                        continue
 
-                # Step C: Solve D (with Fisher weighting)
-                A = X @ V
-                if F_y is not None:
-                    Y_F = Y * F_y.unsqueeze(0)
-                    YB = Y_F @ U
-                    F_U = U * F_y.unsqueeze(1)
-                    BtFB = U.T @ F_U
-                    del Y_F, F_U
-                else:
-                    YB = Y @ U
-                    BtFB = U.T @ U
-                h = (A * YB).sum(dim=0)
-                AtA = A.T @ A
-                G = AtA * BtFB
-                d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
-                S = torch.abs(d)
-                del A, YB, h, AtA, BtFB, G, d
-                if F_y is not None:
-                    del F_y
+                    U_r, S_r, VT_r, bias = self.svd_components[layer_idx][name]
+                    rank = len(S_r)
+                    original_linear = self._get_module_by_name(layer, name)
 
-                # Loss after
-                VT = V.T
-                W_after = (U * S) @ VT
-                loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                    del layer_inputs[name]
 
-                # Check for issues
-                if torch.isnan(W_after).any() or loss_after > loss_before:
+                    # Original target
+                    W_orig = original_linear.weight.data.float().to(self.device)
+                    Y_orig = X @ W_orig.T
+
+                    # Block contribution and adjusted target for SVD
+                    Y_blocks = torch.zeros_like(Y_orig)
+                    if key in self.residual_blocks:
+                        for block in self.residual_blocks[key]:
+                            row, col = block['row'], block['col']
+                            row_end, col_end = block['row_end'], block['col_end']
+                            B_val = block['val'].float().to(self.device)
+                            row_len = row_end - row
+                            col_len = col_end - col
+                            B_use = B_val[:row_len, :col_len]
+                            Y_blocks[:, row:row_end] += X[:, col:col_end] @ B_use.T
+                    Y = Y_orig - Y_blocks
+
+                    # SVD components
                     U = U_r.float().to(self.device)
                     S = S_r.float().to(self.device)
-                    VT = VT_r.float().to(self.device)
-                else:
-                    improvement = (1 - loss_after / loss_before) * 100
-                    total_improvement += improvement
-                    calibrated_count += 1
+                    V = VT_r.T.float().to(self.device)
 
-                    # Update components
+                    # Loss before
+                    W_before = (U * S) @ VT_r.float().to(self.device)
+                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+
+                    if loss_before < 1e-6:
+                        del X, W_orig, Y_orig, Y_blocks, Y, U, S, V, W_before
+                        torch.cuda.empty_cache()
+                        continue
+
+                    reg = 1e-6
+
+                    # Fisher weights (optional)
+                    F_y = None
+                    if use_fisher_weight and hasattr(self, 'fisher_info') and layer_idx in self.fisher_info:
+                        if name in self.fisher_info[layer_idx]:
+                            fisher_raw = self.fisher_info[layer_idx][name]
+                            if fisher_raw.dim() == 1:
+                                F_sigma = fisher_raw.float().to(self.device)
+                            elif fisher_raw.dim() == 2:
+                                if fisher_raw.shape[0] == fisher_raw.shape[1]:
+                                    F_sigma = fisher_raw.diag().float().to(self.device)
+                                else:
+                                    F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                            else:
+                                F_sigma = None
+
+                            if F_sigma is not None and len(F_sigma) >= rank:
+                                F_sigma = F_sigma[:rank]
+                                F_y = (U ** 2) @ F_sigma
+                                F_y = F_y / (F_y.mean() + 1e-10)
+                                F_y = F_y.clamp(min=0.01, max=100.0)
+                                del F_sigma
+
+                    # ALS iterations
+                    for _ in range(num_iters):
+                        Z = (X @ V) * S
+                        U_T_new = torch.linalg.lstsq(Z, Y).solution
+                        U = U_T_new.T
+                        del Z, U_T_new
+
+                        U_s = U * S
+                        if F_y is not None:
+                            F_U_s = U_s * F_y.unsqueeze(1)
+                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T
+                            del F_U_s
+                        else:
+                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T
+                        V = torch.linalg.lstsq(X, Z_target).solution
+                        del U_s, G, Z_target
+
+                    # Solve diagonal scaling
+                    A = X @ V
+                    if F_y is not None:
+                        Y_F = Y * F_y.unsqueeze(0)
+                        YB = Y_F @ U
+                        F_U = U * F_y.unsqueeze(1)
+                        BtFB = U.T @ F_U
+                        del Y_F, F_U
+                    else:
+                        YB = Y @ U
+                        BtFB = U.T @ U
+                    h = (A * YB).sum(dim=0)
+                    AtA = A.T @ A
+                    G = AtA * BtFB
+                    d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
+                    S = torch.abs(d)
+                    del A, YB, h, AtA, BtFB, G, d
+                    if F_y is not None:
+                        del F_y
+
+                    # Loss after
+                    VT = V.T
+                    W_after = (U * S) @ VT
+                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+
+                    # Revert on numerical issues/worse loss
+                    use_original = False
+                    if (
+                        torch.isnan(W_after).any()
+                        or torch.isinf(W_after).any()
+                        or math.isnan(loss_after)
+                        or math.isinf(loss_after)
+                        or loss_after > loss_before
+                    ):
+                        use_original = True
+
+                    if use_original:
+                        U = U_r.float().to(self.device)
+                        S = S_r.float().to(self.device)
+                        VT = VT_r.float().to(self.device)
+                        W_after = (U * S) @ VT
+                        loss_after = loss_before
+                    else:
+                        improvement = (1 - loss_after / loss_before) * 100
+                        proj_improvement += improvement
+                        proj_count += 1
+
+                    # Always write back consistent compressed state for downstream captures.
                     self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
                                                             bias.cpu() if bias is not None else None)
-                    # Note: linear weight will be updated during apply_compression.
-                    # For subsequent layer forward passes in Joint ALS, we must use
-                    # the full approximation: W_approx = W_svd + W_blocks.
                     with torch.no_grad():
                         W_forward = W_after.clone()
                         if key in self.residual_blocks:
@@ -3798,12 +3875,26 @@ class FisherAwareSVD:
                                 row, col = block['row'], block['col']
                                 row_end, col_end = block['row_end'], block['col_end']
                                 B_val = block['val'].float().to(self.device)
-                                W_forward[row:row_end, col:col_end] += B_val
+                                row_len = row_end - row
+                                col_len = col_end - col
+                                W_forward[row:row_end, col:col_end] += B_val[:row_len, :col_len]
                         original_linear.weight.copy_(W_forward.to(original_linear.weight.dtype))
                         del W_forward
 
-                del U, S, V, VT, W_after, X, W_orig, Y_orig, Y_blocks, Y
-                torch.cuda.empty_cache()
+                    del U, S, V, VT, W_after, X, W_orig, Y_orig, Y_blocks, Y
+                    torch.cuda.empty_cache()
+
+                return proj_improvement, proj_count
+
+            # First pass: attention + gate/up
+            imp1, cnt1 = calibrate_projections_with_blocks(attn_mlp_first)
+            total_improvement += imp1
+            calibrated_count += cnt1
+            # Second pass: down_proj with fresh capture after first pass updates
+            if mlp_down:
+                imp2, cnt2 = calibrate_projections_with_blocks(mlp_down)
+                total_improvement += imp2
+                calibrated_count += cnt2
 
             # Forward through layer
             with torch.no_grad():
