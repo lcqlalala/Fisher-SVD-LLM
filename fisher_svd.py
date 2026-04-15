@@ -3792,10 +3792,19 @@ class FisherAwareSVD:
                     # Update components
                     self.svd_components[layer_idx][name] = (U.cpu(), S.cpu(), VT.cpu(),
                                                             bias.cpu() if bias is not None else None)
-                    # Note: linear weight will be updated during apply_compression
-                    # For now, update with SVD approximation for subsequent layer forward passes
+                    # Note: linear weight will be updated during apply_compression.
+                    # For subsequent layer forward passes in Joint ALS, we must use
+                    # the full approximation: W_approx = W_svd + W_blocks.
                     with torch.no_grad():
-                        original_linear.weight.copy_(W_after.to(original_linear.weight.dtype))
+                        W_forward = W_after.clone()
+                        if key in self.residual_blocks:
+                            for block in self.residual_blocks[key]:
+                                row, col = block['row'], block['col']
+                                row_end, col_end = block['row_end'], block['col_end']
+                                B_val = block['val'].float().to(self.device)
+                                W_forward[row:row_end, col:col_end] += B_val
+                        original_linear.weight.copy_(W_forward.to(original_linear.weight.dtype))
+                        del W_forward
 
                 del U, S, V, VT, W_after, X, W_orig, Y_orig, Y_blocks, Y
                 torch.cuda.empty_cache()
