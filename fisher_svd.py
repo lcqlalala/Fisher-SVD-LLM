@@ -2962,21 +2962,14 @@ class FisherAwareSVD:
         if use_residual_blocks and block_budget > 0:
             self.block_size = block_size
             if use_omp_selection:
-                self.phase3b_omp_block_selection(
-                    calib_loader=calib_loader,
-                    block_budget=block_budget,
-                    block_size=block_size,
-                    token_sample_ratio=token_sample_ratio,
-                    top_k_per_iter=omp_top_k_per_iter
-                )
-            else:
-                self.phase3b_residual_block_selection(
-                    block_budget=block_budget,
-                    block_size=block_size,
-                    top_per_row=8,
-                    use_fisher_weight=use_block_fisher_weight,
-                    layer_balance=block_layer_balance
-                )
+                print("Phase 3b: use_omp_selection=True is ignored; using simple residual block selection.")
+            self.phase3b_residual_block_selection(
+                block_budget=block_budget,
+                block_size=block_size,
+                top_per_row=8,
+                use_fisher_weight=use_block_fisher_weight,
+                layer_balance=block_layer_balance
+            )
             if refine_blocks:
                 print("Phase 3b refinement: skipped (Phase 3b is construction-only in current pipeline).")
         elif use_residual_blocks:
