@@ -2038,7 +2038,8 @@ class FisherAwareSVD:
                 "col": blk["col"],
                 "row_end": blk.get("row_end", blk["row"] + block_size),
                 "col_end": blk.get("col_end", blk["col"] + block_size),
-                "val": blk["val"]
+                # Defensive CPU move to avoid VRAM growth if upstream changes.
+                "val": blk["val"].detach().cpu().contiguous()
             })
 
         # Print statistics
@@ -2445,7 +2446,8 @@ class FisherAwareSVD:
                         'col': col_start,
                         'row_end': row_end,
                         'col_end': col_end,
-                        'val': B_val,
+                        # Keep blocks on CPU; Phase 4b loads to GPU on demand.
+                        'val': B_val.detach().cpu().contiguous(),
                         'score': score
                     })
 
