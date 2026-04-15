@@ -2933,15 +2933,15 @@ class FisherAwareSVD:
         Returns:
             Compressed model
         """
-        # Pipeline setting: run Phase 3b for block construction (no refinement).
-        use_phase3b_blocks = bool(use_residual_blocks)
-        if not use_phase3b_blocks and hasattr(self, 'residual_blocks'):
+        # Pipeline setting: run Phase 3b for block construction (no refinement)
+        # when use_residual_blocks is enabled.
+        if not use_residual_blocks and hasattr(self, 'residual_blocks'):
             # Avoid stale blocks when reusing the same compressor instance.
             self.residual_blocks = {}
 
         # Phase 1: SVD Decomposition
         # Store original weights only if Phase 3b block selection is enabled.
-        self.phase1_svd_decomposition(whitening_mat, store_original_weights=use_phase3b_blocks and use_residual_blocks)
+        self.phase1_svd_decomposition(whitening_mat, store_original_weights=use_residual_blocks)
 
         # Phase 2: Sensitivity Estimation
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
@@ -2955,11 +2955,11 @@ class FisherAwareSVD:
             log_sigma_clip_quantile=log_sigma_clip_quantile,
             center_per_projection=center_per_projection,
             layer_factor_strength=layer_factor_strength,
-            use_residual_blocks=use_phase3b_blocks and use_residual_blocks, block_share=block_share
+            use_residual_blocks=use_residual_blocks, block_share=block_share
         )
 
         # Phase 3b: Residual block construction only (selection, no refinement).
-        if use_phase3b_blocks and block_budget > 0:
+        if use_residual_blocks and block_budget > 0:
             self.block_size = block_size
             if use_omp_selection:
                 self.phase3b_omp_block_selection(
@@ -2979,7 +2979,7 @@ class FisherAwareSVD:
                 )
             if refine_blocks:
                 print("Phase 3b refinement: skipped (Phase 3b is construction-only in current pipeline).")
-        elif use_phase3b_blocks:
+        elif use_residual_blocks:
             print(f"Phase 3b: Skipped block construction (block_budget={block_budget}).")
 
         # Clean up cached original weights after block construction.
@@ -2992,7 +2992,7 @@ class FisherAwareSVD:
             try:
                 if use_als:
                     fisher_str = " (Fisher-weighted)" if use_fisher_weight_als else ""
-                    if use_phase3b_blocks and hasattr(self, 'residual_blocks') and len(self.residual_blocks) > 0:
+                    if use_residual_blocks and hasattr(self, 'residual_blocks') and len(self.residual_blocks) > 0:
                         print(f"Starting Phase 4b Joint ALS with blocks ({als_iters} iterations){fisher_str}...")
                         self.phase4_als_calibration_with_blocks(
                             calib_loader,
