@@ -2912,7 +2912,7 @@ class FisherAwareSVD:
                  block_share: float = 0.1,
                  block_size: int = 16,
                  use_block_fisher_weight: bool = True,
-                 block_layer_balance: str = "none",
+                 block_layer_balance: str = "earlier",
                  refine_blocks: bool = False,
                  use_omp_selection: bool = False,
                  omp_top_k_per_iter: int = 32,
@@ -2956,8 +2956,8 @@ class FisherAwareSVD:
             block_size: Size of residual blocks (default: 16)
             use_block_fisher_weight: Use Fisher weighting for block selection (default: True)
                                     Set False for debugging (use pure Frobenius norm)
-            block_layer_balance: Layer balance strategy for block selection (default: "none")
-                                - "none": No layer bias, pure error*Fisher score (recommended)
+            block_layer_balance: Layer balance strategy for block selection (default: "earlier")
+                                - "none": No layer bias, pure error*Fisher score
                                 - "later": Favor later layers
                                 - "earlier": Favor earlier layers
             refine_blocks: Refine block values using lstsq on calibration data (default: True)
@@ -3939,6 +3939,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
                                   use_residual_blocks: bool = True,
                                   block_share: float = 0.1,
                                   block_size: int = 16,
+                                  block_layer_balance: str = "earlier",
                                   use_omp_selection: bool = True,
                                   omp_top_k_per_iter: int = 128,
                                   joint_optimize_iters: int = 0,
@@ -3976,6 +3977,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_residual_blocks: Use dense residual blocks (default: True)
         block_share: Fraction of budget for residual blocks (default: 0.02 = 2%)
         block_size: Size of residual blocks (default: 16)
+        block_layer_balance: Layer-balance strategy for block selection (default: "earlier")
         use_omp_selection: Use OMP for block selection (default: True)
         omp_top_k_per_iter: Top K blocks per OMP iteration (default: 128)
         joint_optimize_iters: Joint SVD+block optimization iterations (default: 2)
@@ -3996,6 +3998,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
     print(f"  Phase 4: {als_str if use_als else 'M-optimization'}")
     if use_residual_blocks:
         print(f"  Residual blocks: {block_share:.0%} budget, size={block_size}, OMP={use_omp_selection}")
+        print(f"  Block layer balance: {block_layer_balance}")
         print(f"  Joint optimization: {joint_optimize_iters} iterations")
 
     compressor = FisherAwareSVD(model, model_name, device, num_gpus=num_gpus)
@@ -4013,6 +4016,7 @@ def fisher_aware_svd_compression(model_name: str, model: nn.Module,
         use_residual_blocks=use_residual_blocks,
         block_share=block_share,
         block_size=block_size,
+        block_layer_balance=block_layer_balance,
         use_omp_selection=use_omp_selection,
         omp_top_k_per_iter=omp_top_k_per_iter,
         joint_optimize_iters=joint_optimize_iters,
