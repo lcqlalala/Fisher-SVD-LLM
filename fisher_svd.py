@@ -2933,15 +2933,21 @@ class FisherAwareSVD:
         Returns:
             Compressed model
         """
+        # Pipeline setting: run Phase 3b for block construction (no refinement).
+        use_phase3b_blocks = bool(use_residual_blocks)
+        if not use_phase3b_blocks and hasattr(self, 'residual_blocks'):
+            # Avoid stale blocks when reusing the same compressor instance.
+            self.residual_blocks = {}
+
         # Phase 1: SVD Decomposition
-        # Store original weights if we'll need them for residual block selection
-        self.phase1_svd_decomposition(whitening_mat, store_original_weights=use_residual_blocks)
+        # Store original weights only if Phase 3b block selection is enabled.
+        self.phase1_svd_decomposition(whitening_mat, store_original_weights=use_phase3b_blocks and use_residual_blocks)
 
         # Phase 2: Sensitivity Estimation
         self.phase2_sensitivity_estimation(calib_loader, use_low_resource)
 
         # Phase 3: Global Truncation with adaptive min/max allocation
-        # If using residual blocks, budget is unified - Phase 3 reserves block_share for blocks
+        # If using residual blocks, Phase 3 reserves block budget for Phase 3b construction.
         block_budget = self.phase3_global_truncation(
             ratio, min_rank=min_rank, fisher_lambda=fisher_lambda,
             sigma_alpha=sigma_alpha,
@@ -2949,19 +2955,56 @@ class FisherAwareSVD:
             log_sigma_clip_quantile=log_sigma_clip_quantile,
             center_per_projection=center_per_projection,
             layer_factor_strength=layer_factor_strength,
-            use_residual_blocks=use_residual_blocks, block_share=block_share
+            use_residual_blocks=use_phase3b_blocks and use_residual_blocks, block_share=block_share
         )
 
-        # Phase 4: Layer-wise Calibration (optimize SVD factors to minimize reconstruction error)
-        # NOTE: Run BEFORE Phase 3b so blocks capture post-ALS residual
+        # Phase 3b: Residual block construction only (selection, no refinement).
+        if use_phase3b_blocks and block_budget > 0:
+            self.block_size = block_size
+            if use_omp_selection:
+                self.phase3b_omp_block_selection(
+                    calib_loader=calib_loader,
+                    block_budget=block_budget,
+                    block_size=block_size,
+                    token_sample_ratio=token_sample_ratio,
+                    top_k_per_iter=omp_top_k_per_iter
+                )
+            else:
+                self.phase3b_residual_block_selection(
+                    block_budget=block_budget,
+                    block_size=block_size,
+                    top_per_row=8,
+                    use_fisher_weight=use_block_fisher_weight,
+                    layer_balance=block_layer_balance
+                )
+            if refine_blocks:
+                print("Phase 3b refinement: skipped (Phase 3b is construction-only in current pipeline).")
+        elif use_phase3b_blocks:
+            print(f"Phase 3b: Skipped block construction (block_budget={block_budget}).")
+
+        # Clean up cached original weights after block construction.
+        if hasattr(self, 'original_weights'):
+            del self.original_weights
+            torch.cuda.empty_cache()
+
+        # Phase 4: Calibration
         if calibration_steps > 0:
             try:
                 if use_als:
                     fisher_str = " (Fisher-weighted)" if use_fisher_weight_als else ""
-                    print(f"Starting Phase 4 ALS calibration ({als_iters} iterations){fisher_str}...")
-                    self.phase4_als_calibration(calib_loader, num_iters=als_iters,
-                                                 update_sigma=True, token_sample_ratio=token_sample_ratio,
-                                                 use_fisher_weight=use_fisher_weight_als)
+                    if use_phase3b_blocks and hasattr(self, 'residual_blocks') and len(self.residual_blocks) > 0:
+                        print(f"Starting Phase 4b Joint ALS with blocks ({als_iters} iterations){fisher_str}...")
+                        self.phase4_als_calibration_with_blocks(
+                            calib_loader,
+                            num_iters=als_iters,
+                            token_sample_ratio=token_sample_ratio,
+                            use_fisher_weight=use_fisher_weight_als
+                        )
+                    else:
+                        print(f"Starting Phase 4 ALS calibration ({als_iters} iterations){fisher_str}...")
+                        self.phase4_als_calibration(calib_loader, num_iters=als_iters,
+                                                     update_sigma=True, token_sample_ratio=token_sample_ratio,
+                                                     use_fisher_weight=use_fisher_weight_als)
                 else:
                     print(f"Starting Phase 4 M-optimization calibration...")
             except Exception as e:
@@ -2972,48 +3015,8 @@ class FisherAwareSVD:
         else:
             print("Phase 4: Skipped (calibration_steps=0)")
 
-        # Phase 3b: Residual Block Selection (if enabled)
-        # NOTE: Run AFTER Phase 4 so blocks capture post-calibration residual
-        if use_residual_blocks and block_budget > 0:
-            self.block_size = block_size  # Store for refinement
-
-            if use_omp_selection:
-                # OMP-style greedy selection with activation-space metrics
-                self.phase3b_omp_block_selection(
-                    calib_loader=calib_loader,
-                    block_budget=block_budget,
-                    block_size=block_size,
-                    token_sample_ratio=token_sample_ratio,
-                    top_k_per_iter=omp_top_k_per_iter
-                )
-
-                # Refine block values using lstsq on calibration data
-                # OMP selects blocks based on activation-space error but uses static residual values
-                # Refinement optimizes these values to minimize actual reconstruction error
-                if refine_blocks and len(self.residual_blocks) > 0:
-                    self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
-            else:
-                # Standard selection based on weight-space residual
-                self.phase3b_residual_block_selection(
-                    block_budget=block_budget,
-                    block_size=block_size,
-                    top_per_row=8,
-                    use_fisher_weight=use_block_fisher_weight,
-                    layer_balance=block_layer_balance
-                )
-
-                # Phase 3b Refinement: Optimize block values using least squares
-                if refine_blocks and len(self.residual_blocks) > 0:
-                    self.phase3b_refine_blocks(calib_loader, token_sample_ratio=token_sample_ratio)
-
-
-            # Clean up original weights to save memory
-            if hasattr(self, 'original_weights'):
-                del self.original_weights
-                torch.cuda.empty_cache()
-
         # Apply compression to model
-        self.apply_compression(ratio)
+        self.apply_compression(ratio, use_residual_blocks=use_residual_blocks)
 
         return self.model
 
