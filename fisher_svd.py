@@ -568,23 +568,6 @@ class FisherAwareSVD:
             parent = getattr(parent, part)
         setattr(parent, parts[-1], new_module)
 
-    def _balance_uv_columns(self, U: torch.Tensor, V: torch.Tensor,
-                            eps: float = 1e-12) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Balance ALS column scales to reduce U/V norm drift while preserving U @ V^T.
-
-        For each rank component i, choose scales a_i, b_i such that:
-            U_i <- a_i * U_i,  V_i <- b_i * V_i,  and a_i * b_i = 1
-        This keeps reconstruction unchanged (for fixed S) but equalizes column norms.
-        """
-        if U.numel() == 0 or V.numel() == 0:
-            return U, V
-        u_norm = torch.linalg.norm(U, dim=0).clamp(min=eps)
-        v_norm = torch.linalg.norm(V, dim=0).clamp(min=eps)
-        scale_u = torch.sqrt(v_norm / u_norm)
-        scale_v = torch.reciprocal(scale_u)
-        return U * scale_u.unsqueeze(0), V * scale_v.unsqueeze(0)
-
     def _apply_signed_diagonal(self, U: torch.Tensor, d: torch.Tensor,
                                eps: float = 1e-12) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -3456,8 +3439,6 @@ class FisherAwareSVD:
                             G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
                             Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T  # (N, r)
                         V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
-                        # Normalize per-rank scales to avoid ALS drift (U exploding / V shrinking).
-                        U, V = self._balance_uv_columns(U, V)
                         del U_s, G, Z_target
 
                     # Step C: Fix U, V, solve D
@@ -3853,8 +3834,6 @@ class FisherAwareSVD:
                             G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
                             Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T
                         V = torch.linalg.lstsq(X, Z_target).solution
-                        # Normalize per-rank scales to avoid ALS drift (U exploding / V shrinking).
-                        U, V = self._balance_uv_columns(U, V)
                         del U_s, G, Z_target
 
                     # Solve diagonal scaling
@@ -3893,15 +3872,6 @@ class FisherAwareSVD:
                         or loss_after > loss_before
                     ):
                         use_original = True
-                    else:
-                        # Guard against severe scale drift even when MSE appears improved.
-                        W_orig_ref = (U_r.float().to(self.device) * S_r.float().to(self.device)) @ VT_r.float().to(self.device)
-                        orig_max = W_orig_ref.abs().max().item()
-                        new_max = W_after.abs().max().item()
-                        if orig_max > 0 and new_max > 10 * orig_max:
-                            use_original = True
-                        del W_orig_ref
-
                     if use_original:
                         U = U_r.float().to(self.device)
                         S = S_r.float().to(self.device)
