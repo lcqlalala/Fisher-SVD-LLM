@@ -583,6 +583,25 @@ class FisherAwareSVD:
         S_pos = d.abs().clamp(min=eps)
         return U_signed, S_pos
 
+    def _matrix_mse_chunked(self, X: torch.Tensor, W_t: torch.Tensor, Y: torch.Tensor,
+                            chunk_rows: int = 8192) -> float:
+        """
+        Compute mean squared error of (X @ W_t - Y) in row chunks to reduce peak VRAM.
+        """
+        n = X.shape[0]
+        if n <= chunk_rows:
+            diff = X @ W_t - Y
+            return (diff.pow(2).mean()).item()
+
+        total_sq = 0.0
+        total_cnt = 0
+        for start in range(0, n, chunk_rows):
+            end = min(start + chunk_rows, n)
+            diff = X[start:end] @ W_t - Y[start:end]
+            total_sq += diff.pow(2).sum().item()
+            total_cnt += diff.numel()
+        return total_sq / max(1, total_cnt)
+
     def phase2_sensitivity_estimation(self, calib_loader: List[Dict],
                                        use_low_resource: bool = True) -> None:
         """
@@ -3211,7 +3230,13 @@ class FisherAwareSVD:
 
         # Compute number of tokens to sample per sequence
         tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+        als_max_rows_env = os.environ.get("FISHER_SVD_ALS_MAX_ROWS", "32768")
+        try:
+            als_max_rows = max(4096, int(als_max_rows_env))
+        except ValueError:
+            als_max_rows = 65536
         print(f"  Sampling {tokens_per_seq} tokens per sequence (total ~{len(calib_loader) * tokens_per_seq} tokens)")
+        print(f"  Phase 4 ALS row cap per projection: {als_max_rows}")
 
         for layer_idx in tqdm(range(len(self.layers))):
             work_device = self.devices[layer_idx % len(self.devices)] if self.use_multi_gpu else self.device
@@ -3351,7 +3376,12 @@ class FisherAwareSVD:
                     original_linear = self._get_module_by_name(layer, name)
 
                     # Stack inputs
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(work_device)
+                    X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0)
+                    if X_cpu.shape[0] > als_max_rows:
+                        idx = torch.randperm(X_cpu.shape[0])[:als_max_rows]
+                        X_cpu = X_cpu.index_select(0, idx)
+                    X = X_cpu.to(work_device)
+                    del X_cpu
                     # X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device).contiguous() # !!!
                     del layer_inputs[name]
 
@@ -3367,7 +3397,7 @@ class FisherAwareSVD:
 
                     # Loss before
                     W_before = (U * S) @ VT_r.float().to(work_device)
-                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+                    loss_before = self._matrix_mse_chunked(X, W_before.T, Y)
                     del W_before
 
                     # Skip ALS if loss_before is already very small - nothing meaningful to optimize
@@ -3474,7 +3504,7 @@ class FisherAwareSVD:
                     # Loss after
                     VT = V.T
                     W_after = (U * S) @ VT
-                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+                    loss_after = self._matrix_mse_chunked(X, W_after.T, Y)
 
                     # Check for NaN/Inf OR if ALS made things worse OR extreme weights - fallback to original SVD
                     use_original = False
@@ -3674,6 +3704,12 @@ class FisherAwareSVD:
         attention_masks = cache['attention_mask']
         position_ids = cache.get('position_ids', None)
         tokens_per_seq = max(1, int(self.model.seqlen * token_sample_ratio))
+        als_max_rows_env = os.environ.get("FISHER_SVD_ALS_MAX_ROWS", "32768")
+        try:
+            als_max_rows = max(4096, int(als_max_rows_env))
+        except ValueError:
+            als_max_rows = 65536
+        print(f"  Phase 4b ALS row cap per projection: {als_max_rows}")
 
         total_improvement = 0.0
         calibrated_count = 0
@@ -3767,15 +3803,18 @@ class FisherAwareSVD:
                     rank = len(S_r)
                     original_linear = self._get_module_by_name(layer, name)
 
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(work_device)
+                    X_cpu = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0)
+                    if X_cpu.shape[0] > als_max_rows:
+                        idx = torch.randperm(X_cpu.shape[0])[:als_max_rows]
+                        X_cpu = X_cpu.index_select(0, idx)
+                    X = X_cpu.to(work_device)
+                    del X_cpu
                     del layer_inputs[name]
 
-                    # Original target
+                    # Original target for joint optimization:
+                    # Y = X @ W_orig^T - X @ W_blocks^T
                     W_orig = original_linear.weight.data.float().to(work_device)
-                    Y_orig = X @ W_orig.T
-
-                    # Block contribution and adjusted target for SVD
-                    Y_blocks = torch.zeros_like(Y_orig)
+                    Y = X @ W_orig.T
                     if key in self.residual_blocks:
                         for block in self.residual_blocks[key]:
                             row, col = block['row'], block['col']
@@ -3784,8 +3823,7 @@ class FisherAwareSVD:
                             row_len = row_end - row
                             col_len = col_end - col
                             B_use = B_val[:row_len, :col_len]
-                            Y_blocks[:, row:row_end] += X[:, col:col_end] @ B_use.T
-                    Y = Y_orig - Y_blocks
+                            Y[:, row:row_end] -= X[:, col:col_end] @ B_use.T
 
                     # SVD components
                     U = U_r.float().to(work_device)
@@ -3794,10 +3832,10 @@ class FisherAwareSVD:
 
                     # Loss before
                     W_before = (U * S) @ VT_r.float().to(work_device)
-                    loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
+                    loss_before = self._matrix_mse_chunked(X, W_before.T, Y)
 
                     if loss_before < 1e-6:
-                        del X, W_orig, Y_orig, Y_blocks, Y, U, S, V, W_before
+                        del X, W_orig, Y, U, S, V, W_before
                         torch.cuda.empty_cache()
                         continue
 
@@ -3868,7 +3906,7 @@ class FisherAwareSVD:
                     # Loss after
                     VT = V.T
                     W_after = (U * S) @ VT
-                    loss_after = ((X @ W_after.T - Y) ** 2).mean().item()
+                    loss_after = self._matrix_mse_chunked(X, W_after.T, Y)
 
                     # Revert on numerical issues/worse loss
                     use_original = False
@@ -3907,7 +3945,7 @@ class FisherAwareSVD:
                         original_linear.weight.copy_(W_forward.to(original_linear.weight.dtype))
                         del W_forward
 
-                    del U, S, V, VT, W_after, X, W_orig, Y_orig, Y_blocks, Y
+                    del U, S, V, VT, W_after, X, W_orig, Y
                     torch.cuda.empty_cache()
 
                 return proj_improvement, proj_count
