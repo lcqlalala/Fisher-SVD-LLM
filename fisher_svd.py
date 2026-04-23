@@ -3136,13 +3136,16 @@ class FisherAwareSVD:
         """
         fisher_str = ", Fisher-weighted" if use_fisher_weight else ""
         print(f"Phase 4: ALS Calibration ({num_iters} iterations, update_sigma={update_sigma}, token_sample={token_sample_ratio:.0%}{fisher_str})...")
+        capture_device = self.devices[0] if self.use_multi_gpu else self.device
+        if self.use_multi_gpu:
+            print(f"  Phase 4 layer calibration uses GPU round-robin over: {self.devices}")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
-            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
-            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(capture_device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(capture_device)
         else:
-            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(capture_device)
 
         # Capture inputs to first layer
         dtype = next(iter(self.model.parameters())).dtype
@@ -3175,13 +3178,13 @@ class FisherAwareSVD:
                         )
                 raise ValueError
 
-        self.layers[0] = self.layers[0].to(self.device)
+        self.layers[0] = self.layers[0].to(capture_device)
         original_layer0 = self.layers[0]
         self.layers[0] = Catcher(self.layers[0])
 
         for batch in calib_loader:
             try:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(capture_device) for k, v in batch.items()}
                 self.model(**batch)
             except ValueError:
                 pass
@@ -3211,16 +3214,17 @@ class FisherAwareSVD:
         print(f"  Sampling {tokens_per_seq} tokens per sequence (total ~{len(calib_loader) * tokens_per_seq} tokens)")
 
         for layer_idx in tqdm(range(len(self.layers))):
-            layer = self.layers[layer_idx].float().to(self.device)
+            work_device = self.devices[layer_idx % len(self.devices)] if self.use_multi_gpu else self.device
+            layer = self.layers[layer_idx].float().to(work_device)
 
             if layer_idx not in self.svd_components:
                 # Just forward through this layer
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            pos_j = position_ids[j].unsqueeze(0).to(work_device)
                             outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                         else:
                             outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
@@ -3323,10 +3327,10 @@ class FisherAwareSVD:
                 # Forward pass to capture inputs
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            pos_j = position_ids[j].unsqueeze(0).to(work_device)
                             _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
                         else:
                             _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
@@ -3347,22 +3351,22 @@ class FisherAwareSVD:
                     original_linear = self._get_module_by_name(layer, name)
 
                     # Stack inputs
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(work_device)
                     # X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device).contiguous() # !!!
                     del layer_inputs[name]
 
                     # Teacher signal
-                    W = original_linear.weight.data.float().to(self.device)
+                    W = original_linear.weight.data.float().to(work_device)
                     Y = X @ W.T
                     # Y = (X @ W.T).contiguous() # !!!
 
                     # SVD components
-                    U = U_r.float().to(self.device)
-                    S = S_r.float().to(self.device)
-                    V = VT_r.T.float().to(self.device)
+                    U = U_r.float().to(work_device)
+                    S = S_r.float().to(work_device)
+                    V = VT_r.T.float().to(work_device)
 
                     # Loss before
-                    W_before = (U * S) @ VT_r.float().to(self.device)
+                    W_before = (U * S) @ VT_r.float().to(work_device)
                     loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
                     del W_before
 
@@ -3389,15 +3393,15 @@ class FisherAwareSVD:
                             # Handle different Fisher shapes
                             if fisher_raw.dim() == 1:
                                 # 1D: F_σ for singular values
-                                F_sigma = fisher_raw.float().to(self.device)
+                                F_sigma = fisher_raw.float().to(work_device)
                             elif fisher_raw.dim() == 2:
                                 # 2D: Full Fisher matrix, use diagonal or reduce
                                 if fisher_raw.shape[0] == fisher_raw.shape[1]:
                                     # Square matrix, take diagonal
-                                    F_sigma = fisher_raw.diag().float().to(self.device)
+                                    F_sigma = fisher_raw.diag().float().to(work_device)
                                 else:
                                     # Non-square, sum over one dimension
-                                    F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                                    F_sigma = fisher_raw.sum(dim=1).float().to(work_device)
                             else:
                                 F_sigma = None
 
@@ -3431,12 +3435,12 @@ class FisherAwareSVD:
                         if F_y is not None:
                             # F_y is (out_dim,), apply as diagonal: F @ U_s = U_s * F_y[:, None]
                             F_U_s = U_s * F_y.unsqueeze(1)  # (out_dim, r)
-                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)  # (r, r)
+                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=work_device, dtype=U.dtype)  # (r, r)
                             # Use solve instead of inv for numerical stability: Z @ G = Y @ F_U_s => Z = solve(G.T, (Y @ F_U_s).T).T
                             Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T  # (N, r)
                             del F_U_s
                         else:
-                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            G = U_s.T @ U_s + reg * torch.eye(rank, device=work_device, dtype=U.dtype)
                             Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T  # (N, r)
                         V = torch.linalg.lstsq(X, Z_target).solution  # (in_dim, r)
                         del U_s, G, Z_target
@@ -3462,7 +3466,7 @@ class FisherAwareSVD:
                         AtA = A.T @ A  # (r, r)
                         G = AtA * BtFB  # Hadamard product (r, r)
 
-                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
+                        d = torch.linalg.solve(G + reg * torch.eye(rank, device=work_device, dtype=G.dtype), h)
                         # Preserve signed direction by absorbing sign(d) into U.
                         U, S = self._apply_signed_diagonal(U, d)
                         del A, YB, h, AtA, BtFB, G, d
@@ -3485,7 +3489,7 @@ class FisherAwareSVD:
                         use_original = True
                     else:
                         # Additional check: ensure weights are not too extreme compared to original
-                        W_orig = (U_r.float().to(self.device) * S_r.float().to(self.device)) @ VT_r.float().to(self.device)
+                        W_orig = (U_r.float().to(work_device) * S_r.float().to(work_device)) @ VT_r.float().to(work_device)
                         orig_max = W_orig.abs().max().item()
                         new_max = W_after.abs().max().item()
                         # If new weights are more than 10x larger than original, revert
@@ -3497,9 +3501,9 @@ class FisherAwareSVD:
 
                     if use_original:
                         # Restore original components
-                        U = U_r.float().to(self.device)
-                        S = S_r.float().to(self.device)
-                        VT = VT_r.float().to(self.device)
+                        U = U_r.float().to(work_device)
+                        S = S_r.float().to(work_device)
+                        VT = VT_r.float().to(work_device)
                         W_after = (U * S) @ VT
                         loss_after = loss_before  # No change
 
@@ -3555,10 +3559,10 @@ class FisherAwareSVD:
             # Forward through layer for next layer's input (now using calibrated weights)
             with torch.no_grad():
                 for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                     if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        pos_j = position_ids[j].unsqueeze(0).to(work_device)
                         outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                     else:
                         outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
@@ -3606,13 +3610,16 @@ class FisherAwareSVD:
 
         fisher_str = ", Fisher-weighted" if use_fisher_weight else ""
         print(f"Phase 4b: Joint ALS with blocks ({num_iters} iters{fisher_str})...")
+        capture_device = self.devices[0] if self.use_multi_gpu else self.device
+        if self.use_multi_gpu:
+            print(f"  Phase 4b layer calibration uses GPU round-robin over: {self.devices}")
 
         # Move embedding layers to device
         if "opt" in self.model_name:
-            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(self.device)
-            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(self.device)
+            self.model.model.decoder.embed_tokens = self.model.model.decoder.embed_tokens.to(capture_device)
+            self.model.model.decoder.embed_positions = self.model.model.decoder.embed_positions.to(capture_device)
         else:
-            self.model.model.embed_tokens = self.model.model.embed_tokens.to(self.device)
+            self.model.model.embed_tokens = self.model.model.embed_tokens.to(capture_device)
 
         dtype = next(iter(self.model.parameters())).dtype
         inps = torch.zeros(
@@ -3642,13 +3649,13 @@ class FisherAwareSVD:
                         )
                 raise ValueError
 
-        self.layers[0] = self.layers[0].to(self.device)
+        self.layers[0] = self.layers[0].to(capture_device)
         original_layer0 = self.layers[0]
         self.layers[0] = Catcher(self.layers[0])
 
         for batch in calib_loader:
             try:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
+                batch = {k: v.to(capture_device) for k, v in batch.items()}
                 self.model(**batch)
             except ValueError:
                 pass
@@ -3673,15 +3680,16 @@ class FisherAwareSVD:
         outs = torch.zeros_like(inps)
 
         for layer_idx in tqdm(range(len(self.layers)), desc="Joint ALS"):
-            layer = self.layers[layer_idx].float().to(self.device)
+            work_device = self.devices[layer_idx % len(self.devices)] if self.use_multi_gpu else self.device
+            layer = self.layers[layer_idx].float().to(work_device)
 
             if layer_idx not in self.svd_components:
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            pos_j = position_ids[j].unsqueeze(0).to(work_device)
                             outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                         else:
                             outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
@@ -3735,10 +3743,10 @@ class FisherAwareSVD:
 
                 with torch.no_grad():
                     for j in range(inps.shape[0]):
-                        inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                        mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                        inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                        mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                         if position_ids is not None and "opt" not in self.model_name:
-                            pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                            pos_j = position_ids[j].unsqueeze(0).to(work_device)
                             _ = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)
                         else:
                             _ = layer(inp_j, attention_mask=mask_j, use_cache=False)
@@ -3759,11 +3767,11 @@ class FisherAwareSVD:
                     rank = len(S_r)
                     original_linear = self._get_module_by_name(layer, name)
 
-                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(self.device)
+                    X = torch.cat([x.reshape(-1, x.shape[-1]) for x in layer_inputs[name]], dim=0).to(work_device)
                     del layer_inputs[name]
 
                     # Original target
-                    W_orig = original_linear.weight.data.float().to(self.device)
+                    W_orig = original_linear.weight.data.float().to(work_device)
                     Y_orig = X @ W_orig.T
 
                     # Block contribution and adjusted target for SVD
@@ -3772,7 +3780,7 @@ class FisherAwareSVD:
                         for block in self.residual_blocks[key]:
                             row, col = block['row'], block['col']
                             row_end, col_end = block['row_end'], block['col_end']
-                            B_val = block['val'].float().to(self.device)
+                            B_val = block['val'].float().to(work_device)
                             row_len = row_end - row
                             col_len = col_end - col
                             B_use = B_val[:row_len, :col_len]
@@ -3780,12 +3788,12 @@ class FisherAwareSVD:
                     Y = Y_orig - Y_blocks
 
                     # SVD components
-                    U = U_r.float().to(self.device)
-                    S = S_r.float().to(self.device)
-                    V = VT_r.T.float().to(self.device)
+                    U = U_r.float().to(work_device)
+                    S = S_r.float().to(work_device)
+                    V = VT_r.T.float().to(work_device)
 
                     # Loss before
-                    W_before = (U * S) @ VT_r.float().to(self.device)
+                    W_before = (U * S) @ VT_r.float().to(work_device)
                     loss_before = ((X @ W_before.T - Y) ** 2).mean().item()
 
                     if loss_before < 1e-6:
@@ -3801,12 +3809,12 @@ class FisherAwareSVD:
                         if name in self.fisher_info[layer_idx]:
                             fisher_raw = self.fisher_info[layer_idx][name]
                             if fisher_raw.dim() == 1:
-                                F_sigma = fisher_raw.float().to(self.device)
+                                F_sigma = fisher_raw.float().to(work_device)
                             elif fisher_raw.dim() == 2:
                                 if fisher_raw.shape[0] == fisher_raw.shape[1]:
-                                    F_sigma = fisher_raw.diag().float().to(self.device)
+                                    F_sigma = fisher_raw.diag().float().to(work_device)
                                 else:
-                                    F_sigma = fisher_raw.sum(dim=1).float().to(self.device)
+                                    F_sigma = fisher_raw.sum(dim=1).float().to(work_device)
                             else:
                                 F_sigma = None
 
@@ -3827,11 +3835,11 @@ class FisherAwareSVD:
                         U_s = U * S
                         if F_y is not None:
                             F_U_s = U_s * F_y.unsqueeze(1)
-                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            G = U_s.T @ F_U_s + reg * torch.eye(rank, device=work_device, dtype=U.dtype)
                             Z_target = torch.linalg.solve(G.T, (Y @ F_U_s).T).T
                             del F_U_s
                         else:
-                            G = U_s.T @ U_s + reg * torch.eye(rank, device=self.device, dtype=U.dtype)
+                            G = U_s.T @ U_s + reg * torch.eye(rank, device=work_device, dtype=U.dtype)
                             Z_target = torch.linalg.solve(G.T, (Y @ U_s).T).T
                         V = torch.linalg.lstsq(X, Z_target).solution
                         del U_s, G, Z_target
@@ -3850,7 +3858,7 @@ class FisherAwareSVD:
                     h = (A * YB).sum(dim=0)
                     AtA = A.T @ A
                     G = AtA * BtFB
-                    d = torch.linalg.solve(G + reg * torch.eye(rank, device=self.device, dtype=G.dtype), h)
+                    d = torch.linalg.solve(G + reg * torch.eye(rank, device=work_device, dtype=G.dtype), h)
                     # Preserve signed direction by absorbing sign(d) into U.
                     U, S = self._apply_signed_diagonal(U, d)
                     del A, YB, h, AtA, BtFB, G, d
@@ -3873,9 +3881,9 @@ class FisherAwareSVD:
                     ):
                         use_original = True
                     if use_original:
-                        U = U_r.float().to(self.device)
-                        S = S_r.float().to(self.device)
-                        VT = VT_r.float().to(self.device)
+                        U = U_r.float().to(work_device)
+                        S = S_r.float().to(work_device)
+                        VT = VT_r.float().to(work_device)
                         W_after = (U * S) @ VT
                         loss_after = loss_before
                     else:
@@ -3892,7 +3900,7 @@ class FisherAwareSVD:
                             for block in self.residual_blocks[key]:
                                 row, col = block['row'], block['col']
                                 row_end, col_end = block['row_end'], block['col_end']
-                                B_val = block['val'].float().to(self.device)
+                                B_val = block['val'].float().to(work_device)
                                 row_len = row_end - row
                                 col_len = col_end - col
                                 W_forward[row:row_end, col:col_end] += B_val[:row_len, :col_len]
@@ -3917,10 +3925,10 @@ class FisherAwareSVD:
             # Forward through layer
             with torch.no_grad():
                 for j in range(inps.shape[0]):
-                    inp_j = inps[j].unsqueeze(0).float().to(self.device)
-                    mask_j = attention_masks[j].unsqueeze(0).to(self.device)
+                    inp_j = inps[j].unsqueeze(0).float().to(work_device)
+                    mask_j = attention_masks[j].unsqueeze(0).to(work_device)
                     if position_ids is not None and "opt" not in self.model_name:
-                        pos_j = position_ids[j].unsqueeze(0).to(self.device)
+                        pos_j = position_ids[j].unsqueeze(0).to(work_device)
                         outs[j] = layer(inp_j, attention_mask=mask_j, position_ids=pos_j, use_cache=False)[0].cpu().to(dtype)
                     else:
                         outs[j] = layer(inp_j, attention_mask=mask_j, use_cache=False)[0].cpu().to(dtype)
