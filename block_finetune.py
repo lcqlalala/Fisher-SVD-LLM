@@ -275,6 +275,59 @@ def load_and_tokenize_dataset(
             texts.append(item['text'])
         text = "\n\n".join(texts)
         print(f"    Loaded c4 {c4_split}: {len(texts)} docs, {len(text):,} chars")
+    elif dataset_name == "alpaca":
+        # Local cached Alpaca dataset (yahma/alpaca-cleaned format)
+        data = load_dataset('/data1/lichangqun/Dobi-SVD/data_cache/yahma___alpaca-cleaned')
+
+        val_set_size = min(2000, max(1, int(len(data["train"]) * 0.05)))
+        train_val = data["train"].train_test_split(
+            test_size=val_set_size, shuffle=True, seed=42
+        )
+
+        def generate_prompt(data_point: Dict[str, str]) -> str:
+            instruction = (data_point.get("instruction") or "").strip()
+            input_text = (data_point.get("input") or "").strip()
+            output_text = (data_point.get("output") or "").strip()
+
+            if input_text:
+                return (
+                    "Below is an instruction that describes a task, paired with an input that provides further context. "
+                    "Write a response that appropriately completes the request.\n\n"
+                    f"### Instruction:\n{instruction}\n\n"
+                    f"### Input:\n{input_text}\n\n"
+                    f"### Response:\n{output_text}"
+                )
+
+            return (
+                "Below is an instruction that describes a task. "
+                "Write a response that appropriately completes the request.\n\n"
+                f"### Instruction:\n{instruction}\n\n"
+                f"### Response:\n{output_text}"
+            )
+
+        def generate_and_tokenize_prompt(data_point: Dict[str, str]) -> Dict[str, List[int]]:
+            full_prompt = generate_prompt(data_point)
+            tokenized = tokenizer(
+                full_prompt,
+                truncation=False,
+                add_special_tokens=False,
+            )
+            tokenized["input_ids"].append(tokenizer.eos_token_id)
+            return {"input_ids": tokenized["input_ids"]}
+
+        if split in ('validation', 'val', 'test'):
+            split_data = train_val["test"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+            split_name = "validation"
+        else:
+            split_data = train_val["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+            split_name = "train"
+
+        flat_tokens = []
+        for ids in split_data["input_ids"]:
+            flat_tokens.extend(ids)
+        tokens = torch.tensor(flat_tokens, dtype=torch.long)
+        print(f"    Loaded alpaca {split_name}: {len(split_data)} samples, {len(tokens):,} tokens")
+        return tokens
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -1226,7 +1279,7 @@ if __name__ == "__main__":
                         help='Use torch.compile for faster training (PyTorch 2.0+, ~2x speedup after warmup)')
 
     # Data
-    parser.add_argument('--dataset', type=str, default='wikitext2', choices=['wikitext2', 'c4'])
+    parser.add_argument('--dataset', type=str, default='wikitext2', choices=['wikitext2', 'c4', 'alpaca'])
     parser.add_argument('--force_download', action='store_true',
                         help='Force re-download dataset (use if cache is corrupted)')
 
