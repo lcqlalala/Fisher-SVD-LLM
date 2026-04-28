@@ -1185,6 +1185,18 @@ class FisherAwareSVD:
         importance_scores = {}
         fisher_used = 0
         fisher_fallback = 0
+        layer_score_debug = defaultdict(lambda: {
+            'score_sum': 0.0,
+            'sigma_sum': 0.0,
+            'fisher_term_sum': 0.0,
+            'count': 0,
+            'proj_total': 0,
+            'proj_with_fisher': 0,
+            'top20_overlap_sum': 0.0,
+            'top20_overlap_count': 0,
+            'top60_overlap_sum': 0.0,
+            'top60_overlap_count': 0,
+        })
 
         # Collect statistics for diagnostics
         fisher_stats = {'min': float('inf'), 'max': 0, 'mean': 0, 'count': 0}
@@ -1238,7 +1250,29 @@ class FisherAwareSVD:
                         log_sigma = log_sigma - log_sigma.median()
                         log_fisher = log_fisher - log_fisher.median()
 
-                    scores = sigma_alpha * log_sigma + fisher_lambda * log_fisher
+                    sigma_only_scores = sigma_alpha * log_sigma
+                    fisher_term = fisher_lambda * log_fisher
+                    scores = sigma_only_scores + fisher_term
+
+                    dbg = layer_score_debug[layer_idx]
+                    dbg['score_sum'] += scores.sum().item()
+                    dbg['sigma_sum'] += sigma_only_scores.sum().item()
+                    dbg['fisher_term_sum'] += fisher_term.sum().item()
+                    dbg['count'] += int(scores.numel())
+                    dbg['proj_total'] += 1
+                    dbg['proj_with_fisher'] += 1
+                    k20 = max(1, int(scores.numel() * 0.2))
+                    fisher_top = set(torch.topk(scores, k20).indices.tolist())
+                    sigma_top = set(torch.topk(sigma_only_scores, k20).indices.tolist())
+                    overlap20 = len(fisher_top & sigma_top) / k20
+                    dbg['top20_overlap_sum'] += overlap20
+                    dbg['top20_overlap_count'] += 1
+                    k60 = max(1, int(scores.numel() * 0.6))
+                    fisher_top_60 = set(torch.topk(scores, k60).indices.tolist())
+                    sigma_top_60 = set(torch.topk(sigma_only_scores, k60).indices.tolist())
+                    overlap60 = len(fisher_top_60 & sigma_top_60) / k60
+                    dbg['top60_overlap_sum'] += overlap60
+                    dbg['top60_overlap_count'] += 1
 
                     # Also compute old formula for comparison
                     old_scores = S.pow(2) * F_safe
@@ -1261,6 +1295,13 @@ class FisherAwareSVD:
                     scores = sigma_alpha * log_sigma
                     old_layer_scores[name] = S.pow(2)
                     fisher_fallback += 1
+
+                    dbg = layer_score_debug[layer_idx]
+                    dbg['score_sum'] += scores.sum().item()
+                    dbg['sigma_sum'] += scores.sum().item()
+                    dbg['fisher_term_sum'] += 0.0
+                    dbg['count'] += int(scores.numel())
+                    dbg['proj_total'] += 1
 
                 layer_scores[name] = scores
 
@@ -1294,6 +1335,42 @@ class FisherAwareSVD:
 
             # Compare rankings between old and new formula
             self._compare_ranking_formulas(old_formula_scores, importance_scores)
+
+        # Layer-wise diagnostics: show whether Fisher term changes ranking.
+        print("  Layer-wise score summary (with-Fisher vs sigma-only):")
+        model_overlap_acc = 0.0
+        model_overlap_layers = 0
+        for layer_idx in sorted(layer_score_debug.keys()):
+            dbg = layer_score_debug[layer_idx]
+            cnt = max(1, dbg['count'])
+            mean_score = dbg['score_sum'] / cnt
+            mean_sigma = dbg['sigma_sum'] / cnt
+            mean_fisher_term = dbg['fisher_term_sum'] / cnt
+            if dbg['top20_overlap_count'] > 0:
+                top20_overlap = 100.0 * dbg['top20_overlap_sum'] / dbg['top20_overlap_count']
+                overlap_str = f"{top20_overlap:.1f}%"
+                model_overlap_acc += top20_overlap
+                model_overlap_layers += 1
+            else:
+                overlap_str = "N/A"
+            if dbg['top60_overlap_count'] > 0:
+                top60_overlap = 100.0 * dbg['top60_overlap_sum'] / dbg['top60_overlap_count']
+                overlap60_str = f"{top60_overlap:.1f}%"
+            else:
+                overlap60_str = "N/A"
+            print(
+                f"    L{layer_idx:02d}: mean(score)={mean_score:.4f}, "
+                f"mean(sigma-only)={mean_sigma:.4f}, mean(fisher-term)={mean_fisher_term:.4f}, "
+                f"fisher projections={dbg['proj_with_fisher']}/{dbg['proj_total']}, "
+                f"top20 overlap={overlap_str}, top60 overlap={overlap60_str}"
+            )
+        if model_overlap_layers > 0:
+            model_avg_overlap = model_overlap_acc / model_overlap_layers
+            fisher_decision_strength = 100.0 - model_avg_overlap
+            print(
+                f"  Global Fisher decision strength: {fisher_decision_strength:.1f}% "
+                f"(100 - layer-avg top20 overlap {model_avg_overlap:.1f}%)"
+            )
 
         return importance_scores
 
@@ -1845,6 +1922,30 @@ class FisherAwareSVD:
         actual_ratio = kept_params / total_original_params
         print(f"  Actual SVD compression ratio: {actual_ratio:.2%}")
         print(f"  Kept {kept_count} singular values out of {total_sv_count}")
+
+        # Layer-wise final rank/param summary for experiment analysis.
+        print("  Layer-wise final ranks and compression:")
+        for layer_idx in sorted(self.svd_components.keys()):
+            layer_kept_sv = 0
+            layer_orig_sv = 0
+            layer_kept_params = 0
+            layer_orig_params = 0
+
+            for name in self.svd_components[layer_idx]:
+                key = (layer_idx, name)
+                info = projection_info[key]
+                kept_r = layer_allocated_rank[key]
+                layer_kept_sv += kept_r
+                layer_orig_sv += info['original_rank']
+                layer_kept_params += kept_r * info['cost']
+                layer_orig_params += info['m'] * info['n']
+
+            rank_ratio = layer_kept_sv / max(1, layer_orig_sv)
+            param_ratio = layer_kept_params / max(1, layer_orig_params)
+            print(
+                f"    L{layer_idx:02d}: rank {layer_kept_sv}/{layer_orig_sv} ({rank_ratio:.2%}), "
+                f"params {layer_kept_params:,}/{layer_orig_params:,} ({param_ratio:.2%})"
+            )
 
         # Store for Phase 3b
         self._total_original_params = total_original_params
